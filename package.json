@@ -1,0 +1,26 @@
+{
+  "name": "shopwice-api",
+  "version": "1.0.0",
+  "description": "Shopwice API (Cloudflare Pages Functions)",
+  "main": "functions/api/[[route]].js",
+  "scripts": {
+    "dev": "wrangler pages dev .",
+    "deploy": "wrangler pages deploy ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@graphql-tools/schema": "^10.0.31",
+    "dataloader": "^2.2.2",
+    "dotenv": "^17.2.3",
+    "graphql-tag": "^2.12.6",
+    "graphql-yoga": "^5.18.0",
+    "itty-router": "^5.0.22",
+    "mysql2": "^3.16.0",
+    "php-serialize": "^5.1.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.63.0"
+  }
+}

@@ -1,0 +1,9 @@
+name = "shopwice-api"
+compatibility_date = "2024-02-09"
+pages_build_output_dir = "./public"
+
+[vars]
+NODE_ENV = "production"
+WC_URL = "https://shopwice.com"
+# Add other non-secret vars here if needed.
+# Secrets like WC_CONSUMER_KEY, DB_PASSWORD must be added via 'wrangler pages secret put' or the Dashboard.

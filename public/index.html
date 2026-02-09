@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shopwice API</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; max-width: 800px; margin: 0 auto; padding: 2rem; line-height: 1.5; }
+        code { background: #f4f4f4; padding: 0.2em 0.4em; border-radius: 3px; }
+        .endpoint { background: #eef; padding: 1rem; margin: 1rem 0; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Shopwice API on Cloudflare Pages</h1>
+    <p>This is the serverless backend for Shopwice, hosted on Cloudflare Pages Functions.</p>
+    
+    <div class="endpoint">
+        <h3>GraphQL Endpoint</h3>
+        <code>/graphql</code>
+        <p>Supports full Shopwice schema.</p>
+    </div>
+
+    <div class="endpoint">
+        <h3>REST API</h3>
+        <code>/api/*</code>
+        <p>Legacy REST endpoints.</p>
+    </div>
+
+    <p>Status: <strong>Operational</strong></p>
+</body>
+</html>
