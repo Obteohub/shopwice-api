@@ -700,16 +700,18 @@ async function getVendorOrder(vendorId, orderId) {
     }
 }
 
-const wcApi = require('../config/woocommerce');
+const WooCommerceClient = require('../utils/wc-client');
 
 /**
  * Create a product for a vendor
  * @param {string|number} vendorId - Vendor User ID
  * @param {Object} productData - Product data (standard WC format)
+ * @param {Object} env - Cloudflare environment variables
  * @returns {Promise<Object>} Created product
  */
-async function createVendorProduct(vendorId, productData) {
+async function createVendorProduct(vendorId, productData, env) {
     try {
+        const wcApi = new WooCommerceClient(env);
         // 1. Create product using WC API (Admin context)
         // Default status to pending if not specified, for safety
         const data = {
@@ -718,8 +720,7 @@ async function createVendorProduct(vendorId, productData) {
             author: parseInt(vendorId)
         };
 
-        const response = await wcApi.post("products", data);
-        const product = response.data;
+        const product = await wcApi.post("products", data);
 
         // 2. Assign to vendor in Database and Force Status if requested
         if (product && product.id) {
@@ -762,10 +763,12 @@ async function createVendorProduct(vendorId, productData) {
  * @param {string|number} vendorId - Vendor User ID (for verification)
  * @param {string|number} productId - Product ID
  * @param {Object} productData - Data to update
+ * @param {Object} env - Cloudflare environment variables
  * @returns {Promise<Object>} Updated product
  */
-async function updateVendorProduct(vendorId, productId, productData) {
+async function updateVendorProduct(vendorId, productId, productData, env) {
     try {
+        const wcApi = new WooCommerceClient(env);
         // 1. Verify ownership
         const [rows] = await db.query(
             "SELECT ID FROM wp_posts WHERE ID = ? AND post_author = ?",
@@ -784,8 +787,8 @@ async function updateVendorProduct(vendorId, productId, productData) {
         }
 
         // 2. Update via WC API
-        const response = await wcApi.put(`products/${productId}`, productData);
-        return response.data;
+        const product = await wcApi.post(`products/${productId}`, productData); // WC API uses POST for updates sometimes, or PUT
+        return product;
     } catch (error) {
         console.error("Update Vendor Product Error:", error.response?.data || error.message);
         throw new Error(error.response?.data?.message || error.message);
@@ -796,10 +799,12 @@ async function updateVendorProduct(vendorId, productId, productData) {
  * Delete a vendor product
  * @param {string|number} vendorId - Vendor User ID
  * @param {string|number} productId - Product ID
+ * @param {Object} env - Cloudflare environment variables
  * @returns {Promise<Object>} Result
  */
-async function deleteVendorProduct(vendorId, productId) {
+async function deleteVendorProduct(vendorId, productId, env) {
     try {
+        const wcApi = new WooCommerceClient(env);
         // 1. Verify ownership
         const [rows] = await db.query(
             "SELECT ID FROM wp_posts WHERE ID = ? AND post_author = ?",
@@ -817,8 +822,8 @@ async function deleteVendorProduct(vendorId, productId) {
         }
 
         // 2. Delete via WC API
-        const response = await wcApi.delete(`products/${productId}`, { force: true });
-        return response.data;
+        const product = await wcApi.delete(`products/${productId}`, { force: true });
+        return product;
     } catch (error) {
         console.error("Delete Vendor Product Error:", error.response?.data || error.message);
         throw new Error(error.response?.data?.message || error.message);
