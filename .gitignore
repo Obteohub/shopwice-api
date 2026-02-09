@@ -25,3 +25,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Temporary Files
+temp_images/
+seed_*.sql
+

@@ -1,4 +1,7 @@
 import { getCollectionData } from '../../src/controllers/collectionData_cf.mjs';
+import crypto from 'node:crypto';
+import SyncService from '../../src/services/syncService.js';
+import db from '../../src/config/db.js';
 
 // ==========================================
 // Simple Router Implementation
@@ -110,8 +113,59 @@ const mockExpress = (req, handler) => new Promise((resolve) => {
 const injectEnv = (req, env) => {
     if (env) {
         Object.assign(process.env, env);
+        // Initialize DB with D1
+        if (db.init) db.init(env);
     }
 };
+
+// ==========================================
+// Webhook Handler
+// ==========================================
+router.post('/webhooks/sync', async (req, env) => {
+    injectEnv(req, env);
+    
+    const secret = env.WEBHOOK_SECRET;
+    if (!secret) {
+        console.error('WEBHOOK_SECRET is not set');
+        return new Response('Webhook Secret not configured', { status: 500 });
+    }
+
+    const signature = req.headers.get('x-wc-webhook-signature');
+    const topic = req.headers.get('x-wc-webhook-topic');
+    
+    if (!signature) return new Response('Missing Signature', { status: 401 });
+
+    const rawBody = await req.text();
+    
+    // Verify Signature
+    const hash = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+    if (hash !== signature) {
+        return new Response('Invalid Signature', { status: 401 });
+    }
+
+    const payload = JSON.parse(rawBody);
+
+    try {
+        console.log(`Received Webhook: ${topic}`);
+        if (topic === 'product.created' || topic === 'product.updated') {
+            await SyncService.syncProduct(payload);
+        } else if (topic === 'product.deleted') {
+            await SyncService.deleteProduct(payload.id);
+        }
+        
+        // Invalidate Cache
+        if (env.shopwice_cache) {
+             const key = `product_${payload.id}`;
+             await env.shopwice_cache.delete(key);
+             console.log(`Cache invalidated for ${key}`);
+        }
+
+        return new Response('Synced', { status: 200 });
+    } catch (e) {
+        console.error('Sync Error:', e);
+        return new Response(e.message, { status: 500 });
+    }
+});
 
 // JWT Helper (Web Crypto API)
 const signJwt = async (payload, secret) => {

@@ -24,6 +24,7 @@ export const onRequest = async (context) => {
         landingPage: false,
         context: {
             ...context,
+            env: { ...context.env, CACHE: context.env.shopwice_cache },
             token: request.headers.get('authorization')?.replace('Bearer ', '').trim(),
             user: null,
             loaders: createLoaders()

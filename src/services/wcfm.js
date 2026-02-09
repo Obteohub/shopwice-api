@@ -33,11 +33,11 @@ async function updateVendorProfile(vendorId, data) {
         const params = [];
 
         if (data.description !== undefined) {
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_description', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, data.description, data.description]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_description', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, data.description, data.description]);
         }
 
         if (data.phone !== undefined) {
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_phone', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, data.phone, data.phone]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_phone', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, data.phone, data.phone]);
         }
 
         // 2. Update Profile Settings (Store Name)
@@ -53,7 +53,7 @@ async function updateVendorProfile(vendorId, data) {
             settings.store_name = data.shop_name;
             const serialized = PHPUnserializer.serialize(settings);
 
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_profile_settings', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, serialized, serialized]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_profile_settings', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, serialized, serialized]);
 
             // Also update Display Name
             await db.query("UPDATE wp_users SET display_name = ? WHERE ID = ?", [data.shop_name, vendorId]);
@@ -72,7 +72,7 @@ async function updateVendorProfile(vendorId, data) {
             Object.assign(address, data.address); // Expects { street_1, city, zip, country, state }
 
             const serialized = PHPUnserializer.serialize(address);
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_location', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, serialized, serialized]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_location', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, serialized, serialized]);
         }
 
         // 4. Update Social (Serialized)
@@ -87,15 +87,15 @@ async function updateVendorProfile(vendorId, data) {
             Object.assign(social, data.social);
 
             const serialized = PHPUnserializer.serialize(social);
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_social_profiles', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, serialized, serialized]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_social_profiles', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, serialized, serialized]);
         }
 
         // 5. Update Logo & Banner
         if (data.store_logo !== undefined) {
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_logo', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, data.store_logo, data.store_logo]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_logo', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, data.store_logo, data.store_logo]);
         }
         if (data.store_banner !== undefined) {
-            await db.query("INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_banner', ?) ON DUPLICATE KEY UPDATE meta_value = ?", [vendorId, data.store_banner, data.store_banner]);
+            await db.query(`INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (?, 'wcfmmp_store_banner', ?) ON CONFLICT(user_id, meta_key) DO UPDATE SET meta_value = ?`, [vendorId, data.store_banner, data.store_banner]);
         }
 
         return getVendor(vendorId);
@@ -272,11 +272,7 @@ async function getVendor(vendorId) {
             LIMIT 1
         `;
 
-        // console.log('Checking vendor permission for ID:', vendorId);
-
         const [rows] = await db.query(sql, [vendorId]);
-
-        // console.log('Vendor query result rows:', rows.length);
 
         if (!rows.length) {
             console.log(`Vendor ${vendorId} not found or missing capability`);

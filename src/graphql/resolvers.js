@@ -4,9 +4,6 @@ const { signJwt } = require('../utils/auth');
 const WooCommerceClient = require('../utils/wc-client');
 const { parseProductAttributes } = require('./attributeParser');
 
-// Simple in-memory cache for Cloudflare (Note: this is per-isolate, not shared)
-const cache = new Map();
-
 // Helper to parse PHP serialized IDs (same as in routes)
 const parseMetaIds = (str) => {
     if (!str) return [];
@@ -91,13 +88,13 @@ const formatWcProduct = (p) => {
 const resolvers = {
     Query: {
         // Single order by ID
-        async order(_, { id }, { user }) {
+        async order(_, { id }, { user, env }) {
             if (!user) throw new Error('Authentication required');
             const wcfm = require('../services/wcfm');
             
             try {
                 // Assuming user.id is the vendor ID
-                const order = await wcfm.getVendorOrder(user.id, id);
+                const order = await wcfm.getVendorOrder(user.id, id, env);
                 return order;
             } catch (error) {
                 console.error('Order resolver error:', error.message);
@@ -106,7 +103,18 @@ const resolvers = {
         },
 
         // Single product by ID or slug
-        async product(_, { id }, { loaders }) {
+        async product(_, { id }, { loaders, env, waitUntil }) {
+            const cacheKey = `product_${id}`;
+            let cached = null;
+            if (env && env.CACHE) {
+                try {
+                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
+                } catch (e) {
+                    console.error('KV Cache Error:', e);
+                }
+            }
+            if (cached) return cached;
+
             // Base SQL (mirrors REST implementation)
             let sql = `
         SELECT
@@ -265,12 +273,12 @@ const resolvers = {
             (SELECT meta_value FROM wp_postmeta WHERE post_id = p.ID AND meta_key = '_thumbnail_id' LIMIT 1) as imageId
           FROM wp_posts p
           LEFT JOIN wp_wc_product_meta_lookup lookup ON p.ID = lookup.product_id
-          WHERE p.ID IN (?)
-        `, [ids]);
+          WHERE p.ID IN (${ids.map(() => '?').join(',')})
+        `, ids);
                 const imgMap = {};
                 const imgIds = pRows.map(r => r.imageId).filter(Boolean);
                 if (imgIds.length) {
-                    const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (?)`, [imgIds]);
+                    const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${imgIds.map(() => '?').join(',')})`, imgIds);
                     imgRows.forEach(i => { imgMap[i.ID] = i.guid; });
                 }
                 return pRows.map(p => {
@@ -378,7 +386,7 @@ const resolvers = {
                 }));
             }
 
-            return {
+            const finalProduct = {
                 id: product.id,
                 databaseId: product.id,
                 productId: product.id,
@@ -424,10 +432,31 @@ const resolvers = {
                     fullHead: ""
                 }
             };
+
+            if (env && env.CACHE) {
+                const ttl = 3600;
+                const putPromise = env.CACHE.put(cacheKey, JSON.stringify(finalProduct), { expirationTtl: ttl });
+                if (waitUntil) waitUntil(putPromise);
+                else await putPromise;
+            }
+
+            return finalProduct;
         },
 
         // List products with pagination (Connection)
-        async products(_, args, { loaders }) {
+        async products(_, args, { loaders, env, waitUntil }) {
+            // Generate Cache Key (basic)
+            const cacheKey = `products_${JSON.stringify(args)}`;
+            let cached = null;
+            if (env && env.CACHE) {
+                try {
+                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
+                } catch (e) {
+                    console.error('KV Cache Error:', e);
+                }
+            }
+            if (cached) return cached;
+
             // Support both old style (direct args) and new WPGraphQL style (where arg)
             const where = args.where || {};
 
@@ -609,7 +638,7 @@ const resolvers = {
             const imageIds = thumbIds.filter(Boolean);
             const imageMap = {};
             if (imageIds.length) {
-                const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (?)`, [imageIds]);
+                const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${imageIds.map(() => '?').join(',')})`, imageIds);
                 imgRows.forEach(i => { imageMap[i.ID] = i.guid; });
             }
 
@@ -697,7 +726,7 @@ const resolvers = {
                 node
             }));
 
-            return {
+            const result = {
                 edges,
                 nodes,
                 totalCount,
@@ -708,12 +737,29 @@ const resolvers = {
                     endCursor: edges.length > 0 ? edges[edges.length - 1].cursor : null
                 }
             };
+
+            if (env && env.CACHE) {
+                // Cache for 15 minutes for lists (shorter than single items)
+                const ttl = 900;
+                const putPromise = env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: ttl });
+                if (waitUntil) waitUntil(putPromise);
+                else await putPromise;
+            }
+
+            return result;
         },
 
         // Simple categories list with Caching
-        async categories() {
+        async categories(_, __, { env, waitUntil }) {
             const cacheKey = 'all_categories';
-            const cached = cache.get(cacheKey);
+            let cached = null;
+            if (env && env.CACHE) {
+                try {
+                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
+                } catch (e) {
+                    console.error('KV Cache Error:', e);
+                }
+            }
             if (cached) return cached;
 
             const [rows] = await db.query(`
@@ -738,12 +784,33 @@ const resolvers = {
                 parent: c.parent,
                 count: c.count
             }));
-            cache.set(cacheKey, result);
+            
+            if (env && env.CACHE && waitUntil) {
+                // Cache for 1 hour
+                waitUntil(env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 }));
+            } else if (env && env.CACHE) {
+                 // Fallback if waitUntil is not available
+                 await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
+            }
+            
             return result;
         },
 
         // New nested categories query (WPGraphQL compatible)
-        async productCategories(_, { where }) {
+        async productCategories(_, { where }, { env, waitUntil }) {
+            // Try to serve from cache if available
+            const cacheKey = where ? `product_categories_${JSON.stringify(where)}` : 'all_product_categories';
+            let cached = null;
+            
+            if (env && env.CACHE) {
+                try {
+                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
+                } catch (e) {
+                    console.error('KV Cache Error:', e);
+                }
+            }
+            if (cached) return cached;
+
             let sql = `
                 SELECT t.term_id as id, t.name, t.slug, tt.description, tt.parent, tt.count
                 FROM wp_terms t
@@ -760,7 +827,7 @@ const resolvers = {
             sql += ` ORDER BY t.name ASC`;
 
             const [rows] = await db.query(sql, params);
-            return {
+            const result = {
                 nodes: rows.map(c => ({
                     id: c.id,
                     databaseId: c.id,
@@ -771,10 +838,34 @@ const resolvers = {
                     count: c.count
                 }))
             };
+
+            // Cache the result
+            if (env && env.CACHE) {
+                const ttl = 3600; // 1 hour
+                const putPromise = env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: ttl });
+                if (waitUntil) {
+                    waitUntil(putPromise);
+                } else {
+                    await putPromise;
+                }
+            }
+
+            return result;
         },
 
         // Get single vendor by ID or slug
-        async vendor(_, { id, slug }) {
+        async vendor(_, { id, slug }, { env, waitUntil }) {
+            const cacheKey = id ? `vendor_id_${id}` : `vendor_slug_${slug}`;
+            let cached = null;
+            if (env && env.CACHE) {
+                try {
+                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
+                } catch (e) {
+                    console.error('KV Cache Error:', e);
+                }
+            }
+            if (cached) return cached;
+
             const wcfm = require('../services/wcfm');
 
             try {
@@ -799,7 +890,7 @@ const resolvers = {
                 }
 
                 // Map WCFM API response to GraphQL schema
-                return {
+                const result = {
                     id: vendorData.id || vendorData.ID,
                     shopName: vendorData.store_name || vendorData.shop_name || vendorData.display_name,
                     shopSlug: vendorData.store_slug || vendorData.user_nicename,
@@ -832,6 +923,15 @@ const resolvers = {
                     memberSince: vendorData.registered || vendorData.member_since,
                     isEnabled: vendorData.status === 'approved' || vendorData.is_store_offline === false
                 };
+
+                if (env && env.CACHE) {
+                    const ttl = 3600;
+                    const putPromise = env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: ttl });
+                    if (waitUntil) waitUntil(putPromise);
+                    else await putPromise;
+                }
+
+                return result;
             } catch (error) {
                 console.error('Vendor resolver error:', error.message);
                 return null;
