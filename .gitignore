@@ -29,4 +29,5 @@ Thumbs.db
 # Temporary Files
 temp_images/
 seed_*.sql
+products.json
 
