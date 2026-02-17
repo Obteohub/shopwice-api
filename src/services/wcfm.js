@@ -386,7 +386,8 @@ async function getVendorProducts(vendorId, params = {}) {
         const imageIds = rows.map(r => r.imageId).filter(Boolean);
         const imageMap = {};
         if (imageIds.length) {
-            const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (?)`, [imageIds]);
+            const placeholders = imageIds.map(() => '?').join(',');
+            const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${placeholders})`, imageIds);
             imgRows.forEach(i => { imageMap[i.ID] = i.guid; });
         }
 
@@ -520,20 +521,16 @@ async function getVendorStats(vendorId, params = {}) {
  * @param {Object} params - Query parameters
  * @returns {Promise<Object>} Orders data
  */
-async function getVendorOrders(vendorId, params = {}) {
+async function getVendorOrders(vendorId, page = 1, perPage = 10, env = null) {
     try {
-        const page = params.page || 1;
-        const perPage = params.perPage || 10;
         const offset = (page - 1) * perPage;
-        const status = params.status;
-
+        
+        // params is actually page, perPage, env in the signature
+        // But the previous implementation used params object. 
+        // Let's align with the resolver call: getVendorOrders(vendorId, page, perPage, env)
+        
         let whereClauses = ["vendor_id = ?"];
         let queryParams = [vendorId];
-
-        if (status) {
-            whereClauses.push("commission_status = ?");
-            queryParams.push(status);
-        }
 
         // Count query
         const countSql = `
@@ -545,7 +542,6 @@ async function getVendorOrders(vendorId, params = {}) {
         const total = countRows[0].total;
 
         // Main query
-        // We aggregate by order_id because one order might have multiple products
         const sql = `
             SELECT 
                 m.order_id,
@@ -563,12 +559,10 @@ async function getVendorOrders(vendorId, params = {}) {
             LIMIT ? OFFSET ?
         `;
 
-        // Need to add pagination params
         const mainQueryParams = [...queryParams, perPage, offset];
-
         const [rows] = await db.query(sql, mainQueryParams);
 
-        // Fetch items for these orders
+        // Fetch items
         const orders = await Promise.all(rows.map(async (order) => {
             const [items] = await db.query(`
                 SELECT 
@@ -598,6 +592,22 @@ async function getVendorOrders(vendorId, params = {}) {
                 };
             }));
 
+            // Fetch Billing/Shipping Address from wp_postmeta (Order Meta)
+            // WCFM orders table doesn't have address. It's in wp_postmeta linked to order_id (post_id)
+            // Or we can fetch from WC API if we have access, but DB is faster.
+            // Let's get basic billing info for now.
+            const [addressMeta] = await db.query(`
+                SELECT meta_key, meta_value FROM wp_postmeta 
+                WHERE post_id = ? AND meta_key IN ('_billing_first_name', '_billing_last_name', '_billing_email')
+            `, [order.order_id]);
+
+            const billing = {};
+            addressMeta.forEach(m => {
+                billing[m.meta_key.replace('_billing_', '')] = m.meta_value;
+            });
+            
+            const customerName = `${billing.first_name || ''} ${billing.last_name || ''}`.trim() || 'Guest';
+
             return {
                 id: order.order_id,
                 order_number: order.order_id,
@@ -606,6 +616,8 @@ async function getVendorOrders(vendorId, params = {}) {
                 commission_status: order.commission_status,
                 total: order.gross_total || 0,
                 commission: order.total_commission || 0,
+                customer_name: customerName,
+                customer_email: billing.email,
                 items: itemsWithImages
             };
         }));
@@ -680,6 +692,19 @@ async function getVendorOrder(vendorId, orderId) {
             };
         }));
 
+        // Fetch Billing/Shipping Address from wp_postmeta (Order Meta)
+        const [addressMeta] = await db.query(`
+            SELECT meta_key, meta_value FROM wp_postmeta 
+            WHERE post_id = ? AND meta_key IN ('_billing_first_name', '_billing_last_name', '_billing_email', '_billing_phone', '_billing_address_1', '_billing_city', '_billing_state', '_billing_postcode', '_billing_country')
+        `, [orderId]);
+
+        const billing = {};
+        addressMeta.forEach(m => {
+            billing[m.meta_key.replace('_billing_', '')] = m.meta_value;
+        });
+        
+        const customerName = `${billing.first_name || ''} ${billing.last_name || ''}`.trim() || 'Guest';
+
         return {
             id: order.order_id,
             order_number: order.order_id,
@@ -688,6 +713,18 @@ async function getVendorOrder(vendorId, orderId) {
             commission_status: order.commission_status,
             total: order.gross_total || 0,
             commission: order.total_commission || 0,
+            customer: {
+                name: customerName,
+                email: billing.email,
+                phone: billing.phone,
+                address: {
+                    address1: billing.address_1,
+                    city: billing.city,
+                    state: billing.state,
+                    postcode: billing.postcode,
+                    country: billing.country
+                }
+            },
             items: itemsWithImages
         };
     } catch (error) {
@@ -832,15 +869,16 @@ async function deleteVendorProduct(vendorId, productId, env) {
  * @param {Object} data - Vendor registration data
  * @returns {Promise<Object>} Created vendor
  */
-async function registerVendor(data) {
+async function registerVendor(data, env) {
     try {
+        const wcApi = new WooCommerceClient(env);
         const {
             email,
             password,
             username,
             first_name,
             last_name,
-            shop_name,
+            shopName,
             phone,
             address
         } = data;
@@ -861,7 +899,9 @@ async function registerVendor(data) {
             }
         });
 
-        const user = userResponse.data;
+        const user = userResponse; // WC Client returns data directly? usually yes.
+        // Wait, wc-client implementation returns `res.json()`.
+        // So userResponse IS the user object.
         const userId = user.id;
 
         // 2. Update Role to 'wcfm_vendor'
@@ -870,6 +910,7 @@ async function registerVendor(data) {
         await db.query("UPDATE wp_usermeta SET meta_value = ? WHERE user_id = ? AND meta_key = 'wp_capabilities'", [capabilities, userId]);
 
         // 3. Set WCFM Specific Meta
+        const shop_name = shopName;
         const storeSlug = shop_name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
         // Profile Settings

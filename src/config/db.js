@@ -18,18 +18,18 @@ module.exports = {
             throw new Error("Database not initialized. Call init(env) first.");
         }
 
-        // Convert MySQL '?' placeholders to D1 (SQLite) '?' placeholders
-        // (They are the same, but we might need to handle specific syntax differences if any)
-        
+        // Validate params to ensure no undefined values (causes D1 bind error 1101)
+        const safeParams = params.map(p => (p === undefined ? null : p));
+
         try {
-            const stmt = d1.prepare(sql).bind(...params);
+            const stmt = d1.prepare(sql).bind(...safeParams);
             const result = await stmt.all();
             
             // mysql2 returns [rows, fields]
             // D1 returns { results: [], success: true, meta: ... }
             return [result.results, result.meta];
         } catch (error) {
-            console.error("D1 Query Error:", error.message, "SQL:", sql);
+            console.error("D1 Query Error:", error.message, "SQL:", sql, "Params:", safeParams);
             throw error;
         }
     },

@@ -59,6 +59,7 @@ Your Shopwice API middleware is now fully functional with complete GraphQL and R
 ✅ `GET /api/products/tags` - Tags
 ✅ `GET /api/brands` - Brands
 ✅ `GET /api/locations` - Locations
+✅ `POST /api/upload` - Media Upload (Multipart)
 
 ### Authentication
 ✅ `POST /api/auth/login` - User login

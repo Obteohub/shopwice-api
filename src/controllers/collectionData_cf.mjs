@@ -1,3 +1,8 @@
+import resolversPkg from '../graphql/resolvers.js';
+const { resolvers } = resolversPkg;
+import dataloadersPkg from '../graphql/dataloaders.js';
+const { createLoaders } = dataloadersPkg;
+
 /**
  * Collection Data Endpoint (Cloudflare Compatible)
  * Returns faceted attribute data for dynamic filtering
@@ -14,70 +19,32 @@ export async function getCollectionData(req, res) {
             tag
         } = req.query;
 
-        // Build GraphQL query
-        const graphqlQuery = `
-            query GetCollectionData($where: RootQueryToProductUnionConnectionWhereArgs) {
-                products(first: 100, where: $where) {
-                    nodes {
-                        ... on SimpleProduct {
-                            attributes {
-                                nodes {
-                                    name
-                                    options
-                                }
-                            }
-                        }
-                        ... on VariableProduct {
-                            attributes {
-                                nodes {
-                                    name
-                                    options
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        `;
+        // Construct Args for GraphQL Resolver
+        const args = {
+            where: {}
+        };
 
-        // Build where clause
-        const where = {};
-        if (category) where.categoryId = parseInt(category);
-        if (search) where.search = search;
-        if (minPrice) where.minPrice = parseFloat(minPrice);
-        if (maxPrice) where.maxPrice = parseFloat(maxPrice);
+        if (category) args.where.categoryId = parseInt(category);
+        if (search) args.where.search = search;
+        if (minPrice) args.where.minPrice = parseFloat(minPrice);
+        if (maxPrice) args.where.maxPrice = parseFloat(maxPrice);
+        
+        if (brand) args.where.brands = brand.split(',').map(s => s.trim());
+        if (location) args.where.locations = location.split(',').map(s => s.trim());
+        if (tag) args.where.tag = tag;
 
-        const variables = { where };
+        // Context
+        const env = req.env || (process && process.env) || {};
+        const context = {
+            env: { ...env, CACHE: env.shopwice_cache },
+            loaders: createLoaders(),
+            waitUntil: (promise) => { if(env.waitUntil) env.waitUntil(promise); }
+        };
 
-        // Query WordPress GraphQL endpoint
-        const WC_URL = process.env.WC_URL; 
-
-        const response = await fetch(
-            WC_URL + '/graphql',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Shopwice-CF-Worker/1.0'
-                },
-                body: JSON.stringify({
-                    query: graphqlQuery,
-                    variables
-                })
-            }
-        );
-
-        const data = await response.json();
-
-        if (data.errors) {
-            console.error('GraphQL errors:', data.errors);
-            return res.status(500).json({
-                error: 'GraphQL query failed',
-                details: data.errors
-            });
-        }
-
-        const products = data.data.products.nodes;
+        // Call Resolver
+        // We use Query.products which returns a connection
+        const result = await resolvers.Query.products(null, args, context);
+        const products = result.nodes || [];
 
         // Aggregate attributes from products
         const attributeMap = new Map();
@@ -86,14 +53,17 @@ export async function getCollectionData(req, res) {
             // Process product attributes
             if (product.attributes?.nodes) {
                 product.attributes.nodes.forEach(attr => {
-                    const taxonomy = attr.name.toLowerCase().startsWith('pa_')
+                    // Use slug as taxonomy if available, otherwise derive
+                    const taxonomy = attr.slug || (attr.name.toLowerCase().startsWith('pa_')
                         ? attr.name
-                        : `pa_${attr.name.toLowerCase().replace(/\s+/g, '-')}`;
+                        : `pa_${attr.name.toLowerCase().replace(/\s+/g, '-')}`);
+                    
+                    const label = attr.label || attr.name;
 
                     if (!attributeMap.has(taxonomy)) {
                         attributeMap.set(taxonomy, {
                             taxonomy,
-                            label: attr.name,
+                            label: label,
                             terms: new Map()
                         });
                     }
@@ -101,12 +71,13 @@ export async function getCollectionData(req, res) {
                     const attrData = attributeMap.get(taxonomy);
 
                     // Count each option
+                    // Resolver returns options as array of strings
                     if (attr.options && Array.isArray(attr.options)) {
                         attr.options.forEach(option => {
                             const slug = option.toLowerCase().replace(/\s+/g, '-');
                             if (!attrData.terms.has(slug)) {
                                 attrData.terms.set(slug, {
-                                    term_id: 0,
+                                    term_id: 0, // We don't have term ID for attribute options in this view
                                     name: option,
                                     slug,
                                     count: 0
@@ -132,8 +103,9 @@ export async function getCollectionData(req, res) {
 
                 product.productBrands.nodes.forEach(brand => {
                     if (!brandData.terms.has(brand.slug)) {
+                        const id = brand.databaseId || brand.id;
                         brandData.terms.set(brand.slug, {
-                            term_id: parseInt(brand.id.replace(/\D/g, '')), // Extract numeric ID
+                            term_id: typeof id === 'string' ? parseInt(id.replace(/\D/g, '')) : id,
                             name: brand.name,
                             slug: brand.slug,
                             count: 0

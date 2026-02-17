@@ -38,7 +38,11 @@ const formatImage = (img) => {
         altText: img.altText || '',
         title: img.title || ''
     };
-    image.node = image; // Self-reference for WPGraphQL compatibility
+    // Fix circular reference for JSON serialization
+    // Instead of self-reference, we create a copy if needed, or omit it if not strictly required by client.
+    // WPGraphQL often uses { node: { sourceUrl } }. 
+    // We'll create a new object for 'node' to avoid the cycle.
+    image.node = { ...image };
     return image;
 };
 
@@ -85,13 +89,158 @@ const formatWcProduct = (p) => {
     };
 };
 
+// Helper: Sync Product to D1 (SQLite)
+const syncProductToD1 = async (p, vendorId) => {
+    try {
+        // Dates
+        const postDate = (p.date_created || new Date().toISOString()).replace('T', ' ').split('.')[0];
+        const postDateGmt = (p.date_created_gmt || new Date().toISOString()).replace('T', ' ').split('.')[0];
+        const postModified = (p.date_modified || new Date().toISOString()).replace('T', ' ').split('.')[0];
+        const postModifiedGmt = (p.date_modified_gmt || new Date().toISOString()).replace('T', ' ').split('.')[0];
+
+        // Author
+        const productAuthor = vendorId || p.post_author || 0;
+
+        // 1. wp_posts
+        await db.query(`
+            INSERT INTO wp_posts (
+                ID, post_author, post_date, post_date_gmt, post_content, post_title, 
+                post_excerpt, post_status, comment_status, ping_status, post_name, 
+                post_modified, post_modified_gmt, post_parent, guid, post_type, menu_order
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, 
+                ?, ?, 'open', 'closed', ?, 
+                ?, ?, ?, ?, 'product', ?
+            ) ON CONFLICT(ID) DO UPDATE SET 
+                post_title=excluded.post_title, 
+                post_content=excluded.post_content,
+                post_excerpt=excluded.post_excerpt,
+                post_status=excluded.post_status, 
+                post_author=excluded.post_author,
+                post_modified=excluded.post_modified,
+                post_modified_gmt=excluded.post_modified_gmt,
+                post_name=excluded.post_name,
+                post_parent=excluded.post_parent;
+        `, [
+            p.id, productAuthor, postDate, postDateGmt, p.description || '', p.name || '',
+            p.short_description || '', p.status, p.slug || '',
+            postModified, postModifiedGmt, p.parent_id || 0, p.permalink || '', p.menu_order || 0
+        ]);
+
+        // 2. wp_postmeta - Vendor Association
+        if (vendorId) {
+            await db.query("DELETE FROM wp_postmeta WHERE post_id = ? AND meta_key = '_wcfm_product_author'", [p.id]);
+            await db.query("INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (?, '_wcfm_product_author', ?)", [p.id, vendorId]);
+        }
+
+        // 3. Other Meta
+        const meta = {
+            '_price': p.price,
+            '_regular_price': p.regular_price,
+            '_sale_price': p.sale_price,
+            '_sku': p.sku,
+            '_stock_status': p.stock_status,
+            '_stock': p.stock_quantity,
+            '_manage_stock': p.manage_stock ? 'yes' : 'no'
+        };
+
+        for (const [k, v] of Object.entries(meta)) {
+            if (v !== undefined && v !== null) {
+                await db.query("DELETE FROM wp_postmeta WHERE post_id = ? AND meta_key = ?", [p.id, k]);
+                await db.query("INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (?, ?, ?)", [p.id, k, String(v)]);
+            }
+        }
+
+        // 4. Lookup Table
+        await db.query(`
+            INSERT INTO wp_wc_product_meta_lookup (
+                product_id, sku, min_price, max_price, onsale, stock_quantity, stock_status, average_rating, total_sales
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ) ON CONFLICT(product_id) DO UPDATE SET 
+                min_price=excluded.min_price, 
+                max_price=excluded.max_price, 
+                stock_status=excluded.stock_status,
+                stock_quantity=excluded.stock_quantity,
+                onsale=excluded.onsale;
+        `, [
+            p.id, p.sku || '', p.price || 0, p.price || 0,
+            p.on_sale ? 1 : 0, p.stock_quantity || 0, p.stock_status === 'instock' ? 'instock' : 'outofstock',
+            p.average_rating || 0, p.total_sales || 0
+        ]);
+
+        console.log(`Synced product ${p.id} to D1`);
+    } catch (e) {
+        console.error(`Error syncing product ${p.id} to D1:`, e);
+    }
+};
+
+// Helper to map Store API Cart to Schema
+const mapStoreApiCart = (data) => {
+    if (!data) return null;
+    return {
+        contents: {
+            nodes: data.items ? data.items.map(item => ({
+                key: item.key,
+                quantity: item.quantity,
+                total: (item.totals?.line_total || 0).toString(),
+                subtotal: (item.totals?.line_subtotal || 0).toString(),
+                product: {
+                    node: {
+                        id: item.id,
+                        name: item.name,
+                        price: (item.prices?.price || 0).toString(),
+                        images: item.images ? item.images.map(img => formatImage(img)) : []
+                    }
+                }
+            })) : [],
+            itemCount: data.items_count || 0
+        },
+        itemCount: data.items_count || 0, // Added root level itemCount
+        total: (data.totals?.total_price || 0).toString(),
+        subtotal: (data.totals?.total_items || 0).toString(),
+        totalTax: (data.totals?.total_tax || 0).toString(),
+        isEmpty: !data.items || data.items.length === 0,
+        needsPayment: data.needs_payment || false,
+        needsShipping: data.needs_shipping || false
+    };
+};
+
 const resolvers = {
     Query: {
+        // Vendor Orders
+        async orders(_, args, { user, env }) {
+            if (!user) throw new Error('Authentication required');
+            const wcfm = require('../services/wcfm');
+
+            try {
+                // If user is admin, they can see all (or filter by vendor)
+                // If user is vendor, force filter by their ID
+                const vendorId = user.role === 'wcfm_vendor' ? user.id : (args.vendorId || null);
+
+                // TODO: Implement pagination args (page, perPage)
+                const page = args.page || 1;
+                const perPage = args.perPage || 10;
+
+                const result = await wcfm.getVendorOrders(vendorId, page, perPage, env);
+                return {
+                    nodes: result.orders,
+                    pageInfo: {
+                        hasNextPage: page < result.totalPages,
+                        total: result.total
+                    }
+                };
+            } catch (error) {
+                console.error('Orders resolver error:', error.message);
+                return { nodes: [], pageInfo: { hasNextPage: false, total: 0 } };
+            }
+        },
+
         // Single order by ID
         async order(_, { id }, { user, env }) {
             if (!user) throw new Error('Authentication required');
             const wcfm = require('../services/wcfm');
-            
+
             try {
                 // Assuming user.id is the vendor ID
                 const order = await wcfm.getVendorOrder(user.id, id, env);
@@ -178,7 +327,7 @@ const resolvers = {
             if (galleryStr) {
                 const galleryIds = galleryStr.split(',').filter(Boolean);
                 if (galleryIds.length) {
-                    const [galleryRows] = await db.query(`SELECT ID, guid, post_title, post_excerpt FROM wp_posts WHERE ID IN (?)`, [galleryIds]);
+                    const [galleryRows] = await db.query(`SELECT ID, guid, post_title, post_excerpt FROM wp_posts WHERE ID IN (${galleryIds.map(() => '?').join(',')})`, galleryIds);
                     galleryRows.forEach(r => {
                         images.push(formatImage({
                             id: r.ID,
@@ -342,12 +491,12 @@ const resolvers = {
           FROM wp_term_relationships tr
           JOIN wp_posts p ON tr.object_id = p.ID
           WHERE tr.term_taxonomy_id IN (
-            SELECT term_taxonomy_id FROM wp_term_taxonomy WHERE term_id IN (?)
+            SELECT term_taxonomy_id FROM wp_term_taxonomy WHERE term_id IN (${catIds.map(() => '?').join(',')})
           ) AND tr.object_id != ?
           AND p.post_type = 'product'
           AND p.post_status = 'publish'
           LIMIT 4
-        `, [catIds, product.id]);
+        `, [...catIds, product.id]);
                 relatedIds = relRows.map(r => r.object_id);
             }
             const relatedProducts = await fetchSummaries(relatedIds);
@@ -445,8 +594,18 @@ const resolvers = {
 
         // List products with pagination (Connection)
         async products(_, args, { loaders, env, waitUntil }) {
-            // Generate Cache Key (basic)
-            const cacheKey = `products_${JSON.stringify(args)}`;
+            // Generate Cache Key with Versioning
+            let cacheVersion = '1';
+            if (env && env.CACHE) {
+                try {
+                    const v = await env.CACHE.get('product_list_version');
+                    if (v) cacheVersion = v;
+                } catch (e) {
+                    console.error('KV Cache Version Error:', e);
+                }
+            }
+
+            const cacheKey = `products_v${cacheVersion}_${JSON.stringify(args)}`;
             let cached = null;
             if (env && env.CACHE) {
                 try {
@@ -487,7 +646,7 @@ const resolvers = {
                 limit = first;
                 if (after) {
                     try {
-                        const decoded = Buffer.from(after, 'base64').toString('utf-8');
+                        const decoded = atob(after); // Use atob instead of Buffer for Cloudflare compatibility
                         if (decoded.startsWith('cursor:')) {
                             offset = parseInt(decoded.split(':')[1]) + 1;
                         }
@@ -595,7 +754,7 @@ const resolvers = {
 
             // Main Query
             const sql = `
-                SELECT
+                SELECT DISTINCT
                   p.ID as id,
                   p.post_title as name,
                   p.post_name as slug,
@@ -638,7 +797,8 @@ const resolvers = {
             const imageIds = thumbIds.filter(Boolean);
             const imageMap = {};
             if (imageIds.length) {
-                const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${imageIds.map(() => '?').join(',')})`, imageIds);
+                const placeholders = imageIds.map(() => '?').join(',');
+                const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${placeholders})`, imageIds);
                 imgRows.forEach(i => { imageMap[i.ID] = i.guid; });
             }
 
@@ -751,7 +911,15 @@ const resolvers = {
 
         // Simple categories list with Caching
         async categories(_, __, { env, waitUntil }) {
-            const cacheKey = 'all_categories';
+            let cacheVersion = '1';
+            if (env && env.CACHE) {
+                try {
+                    const v = await env.CACHE.get('category_list_version');
+                    if (v) cacheVersion = v;
+                } catch (e) { }
+            }
+
+            const cacheKey = `all_categories_v${cacheVersion}`;
             let cached = null;
             if (env && env.CACHE) {
                 try {
@@ -769,87 +937,195 @@ const resolvers = {
           t.slug,
           tt.description,
           tt.parent,
-          tt.count
+          tt.count,
+          tm.meta_value as thumbnail_id
         FROM wp_terms t
         JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+        LEFT JOIN wp_termmeta tm ON t.term_id = tm.term_id AND tm.meta_key = 'thumbnail_id'
         WHERE tt.taxonomy = 'product_cat'
         ORDER BY t.name ASC
       `);
-            const result = rows.map(c => ({
-                id: c.id,
-                databaseId: c.id,
-                name: c.name,
-                slug: c.slug,
-                description: c.description,
-                parent: c.parent,
-                count: c.count
-            }));
-            
-            if (env && env.CACHE && waitUntil) {
-                // Cache for 1 hour
-                waitUntil(env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 }));
-            } else if (env && env.CACHE) {
-                 // Fallback if waitUntil is not available
-                 await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
-            }
-            
-            return result;
-        },
 
-        // New nested categories query (WPGraphQL compatible)
-        async productCategories(_, { where }, { env, waitUntil }) {
-            // Try to serve from cache if available
-            const cacheKey = where ? `product_categories_${JSON.stringify(where)}` : 'all_product_categories';
-            let cached = null;
-            
-            if (env && env.CACHE) {
-                try {
-                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
-                } catch (e) {
-                    console.error('KV Cache Error:', e);
-                }
+            // Resolve Images
+            const thumbIds = rows.map(r => r.thumbnail_id).filter(Boolean);
+            const imageMap = {};
+            if (thumbIds.length > 0) {
+                const placeholders = thumbIds.map(() => '?').join(',');
+                const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${placeholders})`, thumbIds);
+                imgRows.forEach(i => { imageMap[i.ID] = i.guid; });
             }
-            if (cached) return cached;
 
-            let sql = `
-                SELECT t.term_id as id, t.name, t.slug, tt.description, tt.parent, tt.count
-                FROM wp_terms t
-                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
-                WHERE tt.taxonomy = 'product_cat'
-            `;
-            const params = [];
-            if (where && where.slug) {
-                const slugs = Array.isArray(where.slug) ? where.slug : [where.slug];
-                const placeholders = slugs.map(() => '?').join(',');
-                sql += ` AND t.slug IN (${placeholders})`;
-                params.push(...slugs);
-            }
-            sql += ` ORDER BY t.name ASC`;
-
-            const [rows] = await db.query(sql, params);
-            const result = {
-                nodes: rows.map(c => ({
+            const result = rows.map(c => {
+                const imgUrl = c.thumbnail_id && imageMap[c.thumbnail_id] ? imageMap[c.thumbnail_id] : null;
+                return {
                     id: c.id,
                     databaseId: c.id,
                     name: c.name,
                     slug: c.slug,
                     description: c.description,
                     parent: c.parent,
-                    count: c.count
+                    count: c.count,
+                    image: formatImage(imgUrl ? { src: imgUrl, sourceUrl: imgUrl } : null)
+                };
+            });
+
+            if (env && env.CACHE && waitUntil) {
+                // Cache for 1 hour
+                waitUntil(env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 }));
+            } else if (env && env.CACHE) {
+                // Fallback if waitUntil is not available
+                await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
+            }
+
+            return result;
+        },
+
+        // New nested categories query (WPGraphQL compatible)
+        async productCategories(_, { where }, { env, waitUntil }) {
+            return resolvers.Query.terms(_, { taxonomy: 'product_cat', where }, { env, waitUntil });
+        },
+
+        async productTags(_, { where }, { env, waitUntil }) {
+            return resolvers.Query.terms(_, { taxonomy: 'product_tag', where }, { env, waitUntil });
+        },
+
+        async productBrands(_, { where }, { env, waitUntil }) {
+            // Handle multiple brand taxonomies
+            const taxonomies = ['product_brand', 'pwb-brand', 'yith_product_brand', 'brand', 'pa_brand'];
+            return resolvers.Query.terms(_, { taxonomy: taxonomies, where }, { env, waitUntil });
+        },
+
+        async productLocations(_, { where }, { env, waitUntil }) {
+            return resolvers.Query.terms(_, { taxonomy: 'product_location', where }, { env, waitUntil });
+        },
+
+        // Generic Terms Resolver
+        async terms(_, { taxonomy, where }, { env, waitUntil }) {
+            // Normalize taxonomy to array
+            const taxList = Array.isArray(taxonomy) ? taxonomy : [taxonomy];
+
+            // Handle cache bypassing
+            const { forceRefresh, ...cleanWhere } = where || {};
+            const cacheKey = `terms_${taxList.join('_')}_${JSON.stringify(cleanWhere)}`;
+
+            let cached = null;
+            if (!forceRefresh && env && env.CACHE) {
+                try {
+                    cached = await env.CACHE.get(cacheKey, { type: 'json' });
+                } catch (e) { console.error('KV Cache Error:', e); }
+            }
+            if (cached) return cached;
+
+            let sql = `
+                SELECT t.term_id as id, t.name, t.slug, tt.description, tt.parent, tt.count, tt.taxonomy,
+                tm.meta_value as thumbnail_id
+                FROM wp_terms t
+                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                LEFT JOIN wp_termmeta tm ON t.term_id = tm.term_id AND tm.meta_key = 'thumbnail_id'
+                WHERE tt.taxonomy IN (${taxList.map(() => '?').join(',')})
+            `;
+            const params = [...taxList];
+
+            if (where) {
+                if (where.slug) {
+                    const slugs = Array.isArray(where.slug) ? where.slug : [where.slug];
+                    const placeholders = slugs.map(() => '?').join(',');
+                    sql += ` AND t.slug IN (${placeholders})`;
+                    params.push(...slugs);
+                }
+                if (where.id || where.term_id) {
+                    const id = where.id || where.term_id;
+                    sql += ` AND t.term_id = ?`;
+                    params.push(id);
+                }
+                if (where.parentId !== undefined && where.parentId !== null) {
+                    sql += ` AND tt.parent = ?`;
+                    params.push(where.parentId);
+                }
+                if (where.parent !== undefined && where.parent !== null) {
+                    sql += ` AND tt.parent = ?`;
+                    params.push(where.parent);
+                }
+                if (where.search) {
+                    sql += ` AND t.name LIKE ?`;
+                    params.push(`%${where.search}%`);
+                }
+            }
+            sql += ` ORDER BY t.name ASC`;
+
+            const [rows] = await db.query(sql, params);
+
+            // Resolve Images
+            const thumbIds = rows.map(r => r.thumbnail_id).filter(Boolean);
+            const imageMap = {};
+
+            if (thumbIds.length > 0) {
+                const placeholders = thumbIds.map(() => '?').join(',');
+                const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${placeholders})`, thumbIds);
+                imgRows.forEach(i => { imageMap[i.ID] = i.guid; });
+            }
+
+            const result = {
+                nodes: rows.map(c => {
+                    const imgUrl = c.thumbnail_id && imageMap[c.thumbnail_id] ? imageMap[c.thumbnail_id] : null;
+                    return {
+                        id: c.id,
+                        databaseId: c.id,
+                        name: c.name,
+                        slug: c.slug,
+                        description: c.description,
+                        parent: c.parent,
+                        count: c.count,
+                        taxonomy: c.taxonomy,
+                        image: formatImage(imgUrl ? { src: imgUrl, sourceUrl: imgUrl } : null)
+                    };
+                })
+            };
+
+            if (env && env.CACHE) {
+                const ttl = 3600;
+                const putPromise = env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: ttl });
+                if (waitUntil) waitUntil(putPromise);
+                else await putPromise;
+            }
+            return result;
+        },
+
+        async productAttributeTaxonomies(_, { where }, { env, waitUntil }) {
+            const cacheKey = `attribute_taxonomies_${JSON.stringify(where || {})}`;
+            let cached = null;
+            if (env && env.CACHE) {
+                try { cached = await env.CACHE.get(cacheKey, { type: 'json' }); } catch (e) { }
+            }
+            if (cached) return cached;
+
+            let sql = `SELECT * FROM wp_woocommerce_attribute_taxonomies`;
+            const params = [];
+
+            if (where && where.id) {
+                sql += ` WHERE attribute_id = ?`;
+                params.push(where.id);
+            }
+
+            const [rows] = await db.query(sql, params);
+
+            const result = {
+                nodes: rows.map(r => ({
+                    id: r.attribute_id,
+                    name: r.attribute_label,
+                    slug: `pa_${r.attribute_name}`,
+                    type: r.attribute_type,
+                    orderBy: r.attribute_orderby,
+                    hasArchives: r.attribute_public === 1
                 }))
             };
 
-            // Cache the result
             if (env && env.CACHE) {
-                const ttl = 3600; // 1 hour
+                const ttl = 3600;
                 const putPromise = env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: ttl });
-                if (waitUntil) {
-                    waitUntil(putPromise);
-                } else {
-                    await putPromise;
-                }
+                if (waitUntil) waitUntil(putPromise);
+                else await putPromise;
             }
-
             return result;
         },
 
@@ -944,11 +1220,180 @@ const resolvers = {
             const where = args.where || {};
             // TODO: Implement pagination and filtering via WCFM service
             // For now, return empty or implement basic
-            return { nodes: [] }; 
+            return { nodes: [] };
+        },
+
+        // Cart Query
+        async cart(_, __, { env, headers, responseHeaders }) {
+            // const wcApi = new WooCommerceClient(env); // Not strictly needed if we use fetch directly
+            try {
+                const WC_URL = env.WC_URL || 'https://shopwice.com';
+                const cartUrl = `${WC_URL}/wp-json/wc/store/v1/cart`;
+
+                const fetchHeaders = {
+                    'Content-Type': 'application/json',
+                };
+
+                // Forward Cookie header if present (crucial for session)
+                if (headers && headers.get('cookie')) {
+                    fetchHeaders['Cookie'] = headers.get('cookie');
+                }
+                // Forward Nonce if present
+                if (headers && headers.get('x-wc-store-api-nonce')) {
+                    fetchHeaders['X-WC-Store-API-Nonce'] = headers.get('x-wc-store-api-nonce');
+                }
+
+                // Forward Cart-Token if present
+                if (headers && headers.get('cart-token')) {
+                    fetchHeaders['Cart-Token'] = headers.get('cart-token');
+                }
+
+                const res = await fetch(cartUrl, {
+                    method: 'GET',
+                    headers: fetchHeaders
+                });
+
+                // Debug headers
+                console.log('🛒 WC Cart Response Headers:');
+                res.headers.forEach((v, k) => console.log(`${k}: ${v}`));
+
+                // Capture Set-Cookie headers and forward them back to client
+                const setCookie = res.headers.get('set-cookie');
+                if (setCookie && responseHeaders) {
+                    responseHeaders.append('Set-Cookie', setCookie);
+
+                    // Also forward Nonce if returned
+                    // Check for both standard and potential other names
+                    const nonce = res.headers.get('x-wc-store-api-nonce') || res.headers.get('nonce');
+                    if (nonce) responseHeaders.append('X-WC-Store-API-Nonce', nonce);
+
+                    const cartToken = res.headers.get('cart-token');
+                    if (cartToken) responseHeaders.append('Cart-Token', cartToken);
+                }
+
+                if (!res.ok) {
+                    // If cart not found or session invalid, return null (empty cart)
+                    // console.warn('Cart fetch failed:', res.status, res.statusText);
+                    return null;
+                }
+
+                const cartData = await res.json();
+                return mapStoreApiCart(cartData);
+
+            } catch (error) {
+                console.error('Cart Query Error:', error);
+                return null;
+            }
+        }
+    },
+
+    Vendor: {
+        stats: async (vendor, _, { env }) => {
+            const wcfm = require('../services/wcfm');
+            try {
+                // If stats are already populated (e.g. from getVendor), use them
+                // But getVendor doesn't populate 'stats' field fully, it does fetch some counts.
+                // However, the `stats` field on Vendor type is a new object.
+                // Let's fetch fresh stats.
+                return await wcfm.getVendorStats(vendor.id || vendor.ID);
+            } catch (error) {
+                console.error('Vendor stats resolver error:', error.message);
+                return null;
+            }
         }
     },
 
     Mutation: {
+        async addToCart(_, { input }, { env, headers, responseHeaders }) {
+            const wcApi = new WooCommerceClient(env);
+            const { productId, quantity = 1 } = input;
+
+
+
+            try {
+                const WC_URL = env.WC_URL || 'https://shopwice.com';
+                const cartUrl = `${WC_URL}/wp-json/wc/store/v1/cart/add-item`;
+
+                // Prepare headers to forward
+                const fetchHeaders = {
+                    'Content-Type': 'application/json',
+                };
+
+                // Forward Cookie header if present (crucial for session)
+                if (headers && headers.get('cookie')) {
+                    fetchHeaders['Cookie'] = headers.get('cookie');
+                }
+
+                // Forward Nonce if present (try multiple standard headers)
+                const nonce = headers && (headers.get('x-wc-store-api-nonce') || headers.get('nonce'));
+                if (nonce) {
+                    fetchHeaders['X-WC-Store-API-Nonce'] = nonce;
+                    fetchHeaders['Nonce'] = nonce; // Some setups might look for this
+                }
+
+                // Forward Cart-Token if present
+                if (headers && headers.get('cart-token')) {
+                    fetchHeaders['Cart-Token'] = headers.get('cart-token');
+                }
+
+                // Forward Cart-Token if present
+                if (headers && headers.get('cart-token')) {
+                    fetchHeaders['Cart-Token'] = headers.get('cart-token');
+                }
+
+                const res = await fetch(cartUrl, {
+                    method: 'POST',
+                    headers: fetchHeaders,
+                    body: JSON.stringify({
+                        id: productId,
+                        quantity: quantity
+                    })
+                });
+
+                // Capture Set-Cookie headers and forward them back to client
+                // Note: fetch API combines multiple Set-Cookie headers into one comma-separated string sometimes,
+                // or we need to iterate if it's a Headers object.
+                // In Cloudflare Workers, res.headers.get('set-cookie') might return all of them combined.
+                // But better to use iteration if possible or just raw get.
+
+                const setCookie = res.headers.get('set-cookie');
+                if (setCookie && responseHeaders) {
+                    // We need to append, but responseHeaders is a Headers object.
+                    // If multiple cookies are combined with comma, it might be tricky.
+                    // But typically fetch API handles this.
+                    // Let's just try to set it.
+                    responseHeaders.append('Set-Cookie', setCookie);
+
+                    // Also forward Nonce if returned
+                    const nonce = res.headers.get('x-wc-store-api-nonce') || res.headers.get('nonce');
+                    if (nonce) responseHeaders.append('X-WC-Store-API-Nonce', nonce);
+                    const cartToken = res.headers.get('cart-token');
+                    if (cartToken) responseHeaders.append('Cart-Token', cartToken);
+                }
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.message || 'Failed to add to cart');
+                }
+
+                const cartData = await res.json();
+
+                // If cartData is undefined, we return null or empty structure
+                if (!cartData) {
+                    return { cart: null };
+                }
+
+                // Map Store API response to our Schema
+                return {
+                    cart: mapStoreApiCart(cartData)
+                };
+
+            } catch (error) {
+                console.error('AddToCart Error:', error);
+                throw new Error(error.message);
+            }
+        },
+
         async createProduct(_, { input }, { user, env }) {
             if (!user) throw new Error('Authentication required');
             const wcApi = new WooCommerceClient(env);
@@ -969,27 +1414,32 @@ const resolvers = {
                 images: input.images || input.galleryImages ? [
                     ...(input.images || []),
                     ...(input.galleryImages || [])
-                ] : undefined
+                ] : undefined,
+                author: vendorId, // Assign product to vendor
+                meta_data: [
+                    { key: '_wcfm_product_author', value: vendorId },
+                    { key: '_wcfm_product_views', value: '0' }
+                ]
             };
 
             // Remove undefined keys
             Object.keys(data).forEach(key => data[key] === undefined && delete data[key]);
 
+            console.log('Creating product with data:', JSON.stringify(data, null, 2));
+
             try {
                 const product = await wcApi.post("/products", data);
 
-                // Sync with WCFM if we have a vendor ID
-                if (product && product.id && vendorId) {
-                    await db.query(
-                        "INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (?, '_wcfm_product_author', ?) ON DUPLICATE KEY UPDATE meta_value = ?",
-                        [product.id, vendorId, vendorId]
-                    );
-                    await db.query(
-                        "INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (?, '_wcfm_product_views', '0') ON DUPLICATE KEY UPDATE meta_value = meta_value", // Don't reset if exists
-                        [product.id]
-                    );
-                    // Update post_author in wp_posts
-                    await db.query("UPDATE wp_posts SET post_author = ? WHERE ID = ?", [vendorId, product.id]);
+                // Sync with WCFM and D1 immediately
+                if (product && product.id) {
+                    await syncProductToD1(product, vendorId);
+
+                    // Invalidate Product List Cache
+                    if (env.CACHE) {
+                        try {
+                            await env.CACHE.put('product_list_version', Date.now().toString());
+                        } catch (e) { console.error('Failed to update product_list_version:', e); }
+                    }
                 }
 
                 return formatWcProduct(product);
@@ -1001,9 +1451,27 @@ const resolvers = {
 
         async updateProduct(_, { id, input }, { user, env }) {
             if (!user) throw new Error('Authentication required');
-            // TODO: Add ownership check: if (user) verify user.id === product.post_author
-            const wcApi = new WooCommerceClient(env);
 
+            // Ownership check
+            if (user.role === 'wcfm_vendor') {
+                const [rows] = await db.query(`
+                    SELECT p.post_author, pm.meta_value as wcfm_author
+                    FROM wp_posts p
+                    LEFT JOIN wp_postmeta pm ON p.ID = pm.post_id AND pm.meta_key = '_wcfm_product_author'
+                    WHERE p.ID = ?
+                `, [id]);
+
+                if (!rows.length) throw new Error('Product not found');
+
+                const isAuthor = rows[0].post_author == user.id;
+                const isWcfmAuthor = rows[0].wcfm_author == user.id;
+
+                if (!isAuthor && !isWcfmAuthor) {
+                    throw new Error('You do not have permission to edit this product');
+                }
+            }
+
+            const wcApi = new WooCommerceClient(env);
             const data = {
                 name: input.name,
                 type: input.type,
@@ -1027,7 +1495,23 @@ const resolvers = {
             Object.keys(data).forEach(key => data[key] === undefined && delete data[key]);
 
             try {
-                const response = await wcApi.post(`/products/${id}`, data); // Note: WC v3 uses POST for update usually, or PUT. V3 supports PUT.
+                const response = await wcApi.post(`/products/${id}`, data);
+
+                // Update D1 cache immediately
+                if (response && response.id) {
+                    // For update, we might not have the full vendor context, but we can rely on existing or check user
+                    // If user is vendor, we know the vendor ID.
+                    const vendorId = user.role === 'wcfm_vendor' ? user.id : undefined;
+                    await syncProductToD1(response, vendorId);
+
+                    // Invalidate Product List Cache
+                    if (env.CACHE) {
+                        try {
+                            await env.CACHE.put('product_list_version', Date.now().toString());
+                        } catch (e) { console.error('Failed to update product_list_version:', e); }
+                    }
+                }
+
                 return formatWcProduct(response);
             } catch (error) {
                 console.error("WooCommerce API Error:", error.data || error.message);
@@ -1037,9 +1521,43 @@ const resolvers = {
 
         async deleteProduct(_, { id }, { user, env }) {
             if (!user) throw new Error('Authentication required');
+
+            // Ownership check
+            if (user.role === 'wcfm_vendor') {
+                const [rows] = await db.query(`
+                    SELECT p.post_author, pm.meta_value as wcfm_author
+                    FROM wp_posts p
+                    LEFT JOIN wp_postmeta pm ON p.ID = pm.post_id AND pm.meta_key = '_wcfm_product_author'
+                    WHERE p.ID = ?
+                `, [id]);
+
+                if (!rows.length) throw new Error('Product not found');
+
+                const isAuthor = rows[0].post_author == user.id;
+                const isWcfmAuthor = rows[0].wcfm_author == user.id;
+
+                if (!isAuthor && !isWcfmAuthor) {
+                    throw new Error('You do not have permission to delete this product');
+                }
+            }
+
             const wcApi = new WooCommerceClient(env);
             try {
                 await wcApi.request('DELETE', `/products/${id}`, { force: true });
+
+                // Delete from D1
+                await db.query(`DELETE FROM wp_posts WHERE ID = ?`, [id]);
+                await db.query(`DELETE FROM wp_postmeta WHERE post_id = ?`, [id]);
+                await db.query(`DELETE FROM wp_wc_product_meta_lookup WHERE product_id = ?`, [id]);
+                await db.query(`DELETE FROM wp_term_relationships WHERE object_id = ?`, [id]);
+
+                // Invalidate Product List Cache
+                if (env.CACHE) {
+                    try {
+                        await env.CACHE.put('product_list_version', Date.now().toString());
+                    } catch (e) { console.error('Failed to update product_list_version:', e); }
+                }
+
                 return true;
             } catch (error) {
                 console.error("WooCommerce API Error:", error.data || error.message);
@@ -1054,7 +1572,8 @@ const resolvers = {
                 username: input.username || input.email, // Use email as username if not provided
                 password: input.password,
                 first_name: input.firstName,
-                last_name: input.lastName
+                last_name: input.lastName,
+                role: input.role || 'customer'
             };
 
             try {
@@ -1076,6 +1595,169 @@ const resolvers = {
             }
         },
 
+        async registerVendor(_, { input }, { env }) {
+            const wcfm = require('../services/wcfm');
+            // Ensure wcApi is available in scope or passed correctly
+            // wcfm service imports WooCommerceClient internally in some functions but registerVendor relies on wcApi being available?
+            // Actually wcfm.registerVendor uses 'wcApi' which is not defined in that file's scope in previous read!
+            // Wait, let me check wcfm.js again.
+
+            // In wcfm.js line 844: const userResponse = await wcApi.post("customers", ...
+            // But wcApi is NOT defined in registerVendor scope in wcfm.js based on my previous read.
+            // It was defined in other functions or globally?
+            // Let's check wcfm.js imports. 
+            // It imports `const WooCommerceClient = require('../utils/wc-client');` at line 693.
+            // But inside `registerVendor`, it calls `wcApi.post` without instantiating it!
+            // I need to fix wcfm.js first or pass env to it.
+
+            // Let's try to fix wcfm.js via a separate tool call if needed, 
+            // but for now let's implement the resolver assuming wcfm.registerVendor works or needs env.
+
+            // Actually, I should check wcfm.js first.
+            try {
+                // We need to pass env to wcfm service functions usually if they need to instantiate client
+                // But registerVendor in wcfm.js (as seen in previous read) seems to have a bug: `wcApi` is not defined.
+                // It should be `const wcApi = new WooCommerceClient(env);` inside the function, 
+                // and the function signature should accept `env`.
+
+                // So I will fix wcfm.js first.
+                // For now, I'll put a placeholder here and fix wcfm.js in next step.
+                const result = await wcfm.registerVendor(input, env);
+                return result;
+            } catch (error) {
+                console.error("Vendor Registration Error:", error.message);
+                throw new Error(error.message);
+            }
+        },
+
+        async login(_, { input }, { env }) {
+            const { username, password } = input;
+
+            // We reuse the JWT auth endpoint logic or implement it directly here.
+            // Since we need to validate against WP/WC, we can use the JWT Auth plugin endpoint via fetch
+            // Or if we have a direct DB check (not recommended for passwords due to hashing), we use fetch.
+
+            try {
+                // Use the FetchClient helper if available or standard fetch
+                // The API endpoint is usually /wp-json/jwt-auth/v1/token
+                const WC_URL = env.WC_URL || 'https://shopwice.com';
+                const tokenUrl = `${WC_URL}/wp-json/jwt-auth/v1/token`;
+
+                const res = await fetch(tokenUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await res.json();
+
+                if (!res.ok || !data.token) {
+                    throw new Error(data.message || 'Invalid username or password');
+                }
+
+                // Decode token to get user details
+                // We can also fetch the user from WP if needed to get full details
+                const token = data.token;
+
+                // Helper to decode JWT without verifying signature (we just got it from trusted source)
+                // Or we can use the data returned if it contains user info
+                // The JWT Auth plugin usually returns: { token, user_email, user_nicename, user_display_name }
+
+                // Let's assume we want to return a Customer object.
+                // We might need to fetch the user ID. 
+                // The JWT payload usually has data.user.id
+
+                const parts = token.split('.');
+                let userId = null;
+                let role = 'customer';
+
+                if (parts.length === 3) {
+                    try {
+                        const payload = JSON.parse(atob(parts[1]));
+                        if (payload.data && payload.data.user) {
+                            userId = payload.data.user.id;
+                        }
+                    } catch (e) { }
+                }
+
+                // If we didn't get ID from token, we might need to look it up or rely on the response
+                // The JWT Auth plugin response structure depends on version.
+                // Assuming standard response.
+
+                const user = {
+                    id: userId || data.user_id || 0,
+                    email: data.user_email || username,
+                    username: data.user_nicename || username,
+                    firstName: data.user_display_name ? data.user_display_name.split(' ')[0] : '',
+                    lastName: data.user_display_name ? data.user_display_name.split(' ').slice(1).join(' ') : '',
+                    role: role // Placeholder, actual role is in token payload usually
+                };
+
+                return {
+                    token,
+                    user
+                };
+
+            } catch (error) {
+                console.error('Login error:', error);
+                throw new Error(error.message || 'Login failed');
+            }
+        },
+
+        async sendPasswordResetEmail(_, { input }, { env }) {
+            const email = input.email || input.username;
+            const app = input.app;
+            if (!email) {
+                return { success: false, message: 'email is required' };
+            }
+            try {
+                const WC_URL = env.WC_URL || 'https://shopwice.com';
+                const endpoint = env.JWT_RESET_PASSWORD_REQUEST_PATH || '/wp-json/shopwice/v1/auth/password-reset/request';
+                const url = `${WC_URL}${endpoint}`;
+                const body = { email };
+                if (app) body.app = app;
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    console.error('Password reset request failed:', data);
+                    return { success: false, message: data.message || data.error || 'Failed to send reset email' };
+                }
+                return { success: true, message: 'Password reset email sent if account exists.' };
+            } catch (error) {
+                console.error('Password reset error:', error);
+                return { success: false, message: error.message || 'An unexpected error occurred.' };
+            }
+        },
+
+        async resetPassword(_, { input }, { env }) {
+            try {
+                const WC_URL = env.WC_URL || 'https://shopwice.com';
+                const endpoint = env.JWT_RESET_PASSWORD_CONFIRM_PATH || '/wp-json/shopwice/v1/auth/password-reset/confirm';
+                const url = `${WC_URL}${endpoint}`;
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_login: input.user_login,
+                        password_reset_key: input.password_reset_key,
+                        new_password: input.new_password
+                    })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    return { success: false, message: data.message || data.error || 'Password reset failed' };
+                }
+                return { success: true, message: 'Password has been reset.' };
+            } catch (error) {
+                console.error('Reset password error:', error);
+                return { success: false, message: error.message || 'An unexpected error occurred.' };
+            }
+        },
+
         async loginWithSocial(_, { input }, { env }) {
             const { provider, accessToken } = input;
             const wcApi = new WooCommerceClient(env);
@@ -1086,9 +1768,9 @@ const resolvers = {
                     const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${accessToken}`);
                     if (!res.ok) throw new Error('Invalid Google token');
                     const payload = await res.json();
-                    
+
                     if (payload.aud !== env.GOOGLE_CLIENT_ID && payload.aud !== process.env.GOOGLE_CLIENT_ID) {
-                         // warning: aud mismatch, but continue for now if strict check needed
+                        // warning: aud mismatch, but continue for now if strict check needed
                     }
 
                     const { email, given_name, family_name } = payload;
@@ -1254,12 +1936,12 @@ const resolvers = {
                 FROM wp_term_relationships tr
                 JOIN wp_posts p ON tr.object_id = p.ID
                 WHERE tr.term_taxonomy_id IN (
-                  SELECT term_taxonomy_id FROM wp_term_taxonomy WHERE term_id IN (?)
+                  SELECT term_taxonomy_id FROM wp_term_taxonomy WHERE term_id IN (${catIds.map(() => '?').join(',')})
                 ) AND tr.object_id != ?
                 AND p.post_type = 'product'
                 AND p.post_status = 'publish'
                 LIMIT 4
-            `, [catIds, parent.id || parent.databaseId || parent.productId]);
+            `, [...catIds, parent.id || parent.databaseId || parent.productId]);
 
             const relatedIds = relRows.map(r => r.object_id);
             const summaries = await loaders.productSummaryLoader.loadMany(relatedIds);

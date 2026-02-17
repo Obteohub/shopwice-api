@@ -20,5 +20,13 @@ bucket_name = "shopwice-media"
 [vars]
 NODE_ENV = "production"
 WC_URL = "https://shopwice.com"
-# Add other non-secret vars here if needed.
-# Secrets like WC_CONSUMER_KEY, DB_PASSWORD must be added via 'wrangler pages secret put' or the Dashboard.
+WC_API_VERSION = "wc/v3"
+WAREHOUSE_LATITUDE = "5.6037"
+WAREHOUSE_LONGITUDE = "-0.1870"
+JWT_TOKEN_PATH = "/wp-json/jwt-auth/v1/token"
+JWT_REGISTER_PATH = "/wp-json/shopwice/v1/auth/register"
+JWT_RESET_PASSWORD_REQUEST_PATH = "/wp-json/shopwice/v1/auth/password-reset/request"
+JWT_RESET_PASSWORD_CONFIRM_PATH = "/wp-json/shopwice/v1/auth/password-reset/confirm"
+GOOGLE_CLIENT_ID = "359067785639-9irudgfp0rlfo4t4ulsnclunhsiglqsa.apps.googleusercontent.com"
+FACEBOOK_APP_ID = "2368660256582381"
+# Secrets like WC_CONSUMER_KEY, JWT_SECRET, GOOGLE_PLACES_API_KEY must be added via 'wrangler pages secret put' or the Dashboard.

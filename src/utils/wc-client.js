@@ -1,7 +1,7 @@
 const crypto = globalThis.crypto;
 
 class WooCommerceClient {
-    constructor(env) {
+    constructor(env, token = null) {
         this.env = env || {};
         // Fallback to process.env if available (Node.js)
         if (typeof process !== 'undefined' && process.env) {
@@ -11,6 +11,7 @@ class WooCommerceClient {
         this.url = this.env.WC_URL || 'https://shopwice.com';
         this.consumerKey = this.env.WC_CONSUMER_KEY;
         this.consumerSecret = this.env.WC_CONSUMER_SECRET;
+        this.token = token;
     }
 
     async get(endpoint, params = {}) {
@@ -25,15 +26,19 @@ class WooCommerceClient {
         const url = new URL(this.url + '/wp-json/wc/v3' + endpoint);
         Object.keys(params).forEach(key => url.searchParams.append(key, params[key]));
 
-        // Basic Auth
-        const auth = btoa(`${this.consumerKey}:${this.consumerSecret}`);
-        
         const headers = {
-            'Authorization': `Basic ${auth}`,
             'Content-Type': 'application/json',
             'User-Agent': 'Shopwice-CF-Worker/1.0'
         };
 
+        if (this.token) {
+            headers['Authorization'] = `Bearer ${this.token}`;
+        } else {
+            // Basic Auth
+            const auth = btoa(`${this.consumerKey}:${this.consumerSecret}`);
+            headers['Authorization'] = `Basic ${auth}`;
+        }
+        
         const options = {
             method,
             headers,

@@ -1,0 +1,355 @@
+# Shopwice API - PWA Development Instructions
+
+## Project Overview
+This is a headless WooCommerce API powered by Cloudflare Workers/Pages, serving a vendor PWA and customer storefront. It provides a GraphQL and REST API interface to WooCommerce with local caching via D1 database and R2 media storage.
+
+## Architecture
+
+### Tech Stack
+- **Runtime**: Cloudflare Workers/Pages Functions
+- **Database**: Cloudflare D1 (SQLite-compatible)
+- **Storage**: Cloudflare R2 (S3-compatible)
+- **Cache**: Cloudflare KV
+- **Backend**: WordPress + WooCommerce + WCFM (Multi-vendor)
+- **API Types**: REST + GraphQL
+
+### Key Components
+1. **REST API**: `functions/api/[[route]].js` - Main API router
+2. **GraphQL API**: `src/graphql/schema.js` + `src/graphql/resolvers.js`
+3. **Database**: `src/config/db.js` - D1 database connection
+4. **Sync Service**: `src/services/syncService.js` - Syncs WooCommerce data to D1
+5. **Media Upload**: Dual upload to R2 (CDN) + WordPress (validation)
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/login` - JWT authentication
+- `POST /api/auth/register` - Customer/Vendor registration
+- `POST /api/auth/verify` - Token validation
+- `POST /api/auth/forgot-password` - Password reset request
+- `POST /api/auth/reset-password` - Password reset confirmation
+- `POST /api/auth/google` - Google OAuth
+- `POST /api/auth/facebook` - Facebook OAuth
+
+### Products (Public)
+- `GET /api/products` - List products (uses D1 cache)
+- `GET /api/products/:id` - Single product
+- `GET /api/categories` - Product categories
+- `GET /api/tags` - Product tags
+- `GET /api/brands` - Product brands
+- `GET /api/attributes` - Product attributes
+- `GET /api/attributes/:id/terms` - Attribute terms
+
+### Vendor Products (Protected - Requires Bearer Token)
+- `GET /api/vendor/products` - List vendor's products
+- `POST /api/vendor/products` - Create product
+- `POST /api/vendor/products/:id` - Update product
+- `DELETE /api/vendor/products/:id` - Delete product
+- `GET /api/vendor/products/:id` - Single product
+
+### Media Upload (Protected)
+- `POST /api/upload` - Upload image
+- `POST /api/media` - WordPress-compatible endpoint
+- `POST /api/vendor/media` - Vendor-specific endpoint
+
+**Important**: All three endpoints use the same handler. Images are uploaded to BOTH:
+1. **Cloudflare R2** - For CDN serving
+2. **WordPress Media Library** - For WooCommerce validation
+
+### Vendor Management (Protected)
+- `GET /api/vendor/list` - Public vendor list
+- `GET /api/vendor/:id` - Single vendor profile
+- `GET /api/vendor/orders` - Vendor orders
+- `GET /api/vendor/orders/:id` - Single order
+- `GET /api/vendor/settings` - Vendor settings
+- `POST /api/vendor/settings` - Update settings
+- `GET /api/vendor/sales-stats` - Sales statistics
+
+### Cart & Checkout
+- `GET /api/cart` - Get cart
+- `POST /api/cart/add` - Add item
+- `POST /api/cart/update` - Update item
+- `POST /api/cart/remove` - Remove item
+- `POST /api/checkout` - Process checkout
+- `GET /api/checkout/state` - Checkout state
+- `POST /api/checkout/cart/update-customer` - Update customer info
+
+### Orders
+- `GET /api/orders` - List orders
+- `POST /api/orders` - Create order
+- `GET /api/payment-gateways` - Available payment methods
+
+### Webhooks
+- `POST /api/webhooks/sync` - WooCommerce webhook receiver
+  - Handles: product.created, product.updated, product.deleted
+  - Handles: term.created, term.updated, term.deleted (categories, tags, brands, attributes)
+  - Validates signature with WEBHOOK_SECRET
+
+## Development Guidelines
+
+### 1. API Route Development
+When adding new routes to `functions/api/[[route]].js`:
+```javascript
+router.post('/api/new-endpoint', async (req, env) => {
+    injectEnv(req, env); // Initialize environment
+    
+    // Get auth token if needed
+    const authHeader = req.headers.get('authorization');
+    const token = authHeader ? authHeader.replace('Bearer ', '') : null;
+    const userId = getUserIdFromRequest(req);
+    
+    // Your logic here
+    
+    return new Response(JSON.stringify({ success: true }));
+});
+```
+
+### 2. Database Queries
+Use the centralized db.js module:
+```javascript
+const dbConfig = require('../../src/config/db.js');
+dbConfig.init(env);
+
+const result = await dbConfig.query('SELECT * FROM wp_posts WHERE ID = ?', [productId]);
+const rows = result.results || result;
+```
+
+### 3. Media Upload Flow
+When handling image uploads:
+- Accept `file` or `image` from FormData
+- Upload to R2 for CDN serving
+- Upload to WordPress for WooCommerce validation
+- Store metadata in D1 database
+- Return WordPress media ID (used in product creation)
+
+### 4. Authentication
+- Use Bearer tokens from JWT
+- Extract user ID using `getUserIdFromRequest(req)`
+- Validate against WordPress JWT endpoint when needed
+- Check user roles: `wcfm_vendor`, `administrator`, `customer`
+
+### 5. Vendor Operations
+Vendor endpoints proxy to WordPress/WooCommerce with the vendor's Bearer token:
+```javascript
+const api = new FetchClient(env, 'wc', token); // Use vendor token
+const data = await api.post('/products', productData);
+```
+This ensures WCFM automatically assigns products to the correct vendor.
+
+## Common Tasks
+
+### Adding a New Product Field
+1. Update GraphQL schema: `src/graphql/schema.js`
+2. Update resolver: `src/graphql/resolvers.js`
+3. Update sync service: `src/services/syncService.js`
+4. Test sync webhook
+
+### Testing Locally
+```bash
+# Start dev server
+npm run dev
+
+# Test endpoint
+curl http://localhost:8788/api/products
+
+# Test with auth
+curl -H "Authorization: Bearer YOUR_TOKEN" http://localhost:8788/api/vendor/products
+```
+
+### Debugging
+- Check dev server logs: `.wrangler/state/v3/d1/` for D1 database
+- Check R2 uploads: Local R2 stored in `.wrangler/state/v3/r2/`
+- Use `console.log()` - visible in wrangler dev output
+
+## Important Notes
+
+### Environment Variables (Required)
+- `JWT_SECRET` - JWT signing secret
+- `WC_CONSUMER_KEY` - WooCommerce API key
+- `WC_CONSUMER_SECRET` - WooCommerce API secret
+- `WC_URL` - WordPress site URL (e.g., https://shopwice.com)
+- `WEBHOOK_SECRET` - Webhook signature validation
+- `R2_PUBLIC_URL` - R2 public bucket URL
+- `GOOGLE_PLACES_API_KEY` - For address autocomplete
+- `GOOGLE_CLIENT_ID` - Google OAuth
+- `FACEBOOK_APP_ID` - Facebook OAuth
+
+### Bindings (Cloudflare)
+- `env.DB` - D1 Database binding
+- `env.R2` - R2 Bucket binding
+- `env.shopwice_cache` - KV Namespace binding
+
+### CORS Headers
+All endpoints automatically include CORS headers:
+```javascript
+'Access-Control-Allow-Origin': '*'
+'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-WC-Store-API-Nonce'
+```
+
+### GraphQL vs REST
+- **GraphQL**: For complex queries with relationships (products with categories, reviews, etc.)
+- **REST**: For simple CRUD operations, vendor management, uploads
+
+## File Structure
+```
+shopwice-api/
+├── functions/
+│   └── api/
+│       └── [[route]].js          # Main API router (REST)
+├── src/
+│   ├── graphql/
+│   │   ├── schema.js             # GraphQL schema
+│   │   ├── resolvers.js          # GraphQL resolvers
+│   │   └── dataloaders.js        # DataLoader for N+1 optimization
+│   ├── services/
+│   │   └── syncService.js        # WooCommerce sync logic
+│   ├── controllers/
+│   │   └── collectionData_cf.mjs # Collection data aggregation
+│   └── config/
+│       └── db.js                 # Database connection
+├── scripts/                      # Test and utility scripts
+├── wordpress-plugin/             # WordPress custom plugins
+└── wrangler.toml                 # Cloudflare configuration
+```
+
+## Best Practices
+
+1. **Always use `injectEnv(req, env)`** at the start of route handlers
+2. **Handle both success and error cases** with proper HTTP status codes
+3. **Use FetchClient** for WooCommerce API calls (handles auth automatically)
+4. **Cache GraphQL queries** using DataLoader and KV
+5. **Validate webhook signatures** before processing
+6. **Return WordPress media IDs** from upload endpoints (not local D1 IDs)
+7. **Test with the vendor user** (kwessi@gmail.com) for vendor operations
+8. **Check WCFM ownership** - WordPress/WCFM enforces vendor ownership automatically
+
+## Testing Scripts
+Use scripts in `scripts/` directory:
+- `test_create_product_with_image.js` - Test product creation with image upload
+- `test_vendor_flow.js` - Test complete vendor workflow
+- `test_login.js` - Test authentication
+- `verify_vendor_products.js` - Verify vendor can see their products
+
+## PWA Frontend Integration
+
+### Authentication Flow
+```javascript
+// Login
+const response = await fetch('https://api.shopwice.com/api/auth/login', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ username, password })
+});
+const { token, user } = await response.json();
+
+// Store token
+localStorage.setItem('authToken', token);
+
+// Use in requests
+fetch('https://api.shopwice.com/api/vendor/products', {
+  headers: { 'Authorization': `Bearer ${token}` }
+});
+```
+
+### Image Upload Flow
+```javascript
+// Upload image first
+const formData = new FormData();
+formData.append('file', imageFile);
+
+const uploadRes = await fetch('https://api.shopwice.com/api/media', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${token}` },
+  body: formData
+});
+const { id: imageId, source_url } = await uploadRes.json();
+
+// Then create/update product with image and location
+const productData = {
+  name: 'Product Name',
+  regular_price: '99.99',
+  images: [{ id: imageId, src: source_url }],
+  locations: [{ id: locationId }],  // product_location taxonomy
+  categories: [{ id: categoryId }]
+};
+
+await fetch('https://api.shopwice.com/api/vendor/products', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify(productData)
+});
+```
+
+### Error Handling
+```javascript
+try {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Request failed');
+  }
+  const data = await response.json();
+  return data;
+} catch (error) {
+  console.error('API Error:', error.message);
+  // Show user-friendly error
+}
+```
+
+## Deployment
+
+### Deploy to Cloudflare Pages
+```bash
+# Deploy to production
+npm run deploy
+
+# Deploy to preview
+wrangler pages deploy . --project-name=shopwice-api --branch=preview
+```
+
+### Environment Variables in Production
+Set in Cloudflare Dashboard:
+- Pages → Settings → Environment Variables
+- Add all variables from `.dev.vars`
+- Set bindings for D1, R2, and KV
+
+## Troubleshooting
+
+### Image Upload Returns 404
+- Check if route exists: `/api/upload`, `/api/media`, or `/api/vendor/media`
+- Verify R2 binding is configured
+- Check authentication token is valid
+
+### Product Creation Fails with "Invalid Image ID"
+- Ensure image was uploaded to WordPress (dual upload)
+- Use the returned `id` (WordPress media ID) in product creation
+- Don't use local D1 ID for WooCommerce products
+
+### Product Location Gets Missing on Create/Edit
+- **Format**: Send `locations: [{ id: locationId }]` (same format as categories)
+- **Alternate formats supported**: `location_ids: [1,2]`, `product_location: [1]`, `location: 5` - all get normalized
+- **WordPress**: Ensure `product_location` taxonomy is registered with `show_in_rest => true` for REST API
+- **Sync**: SyncService syncs locations to D1 when webhook fires - locations must be in WooCommerce response
+
+### Webhook Sync Failing
+- Verify webhook signature with WEBHOOK_SECRET
+- Check webhook topic matches handlers
+- Ensure D1 database is initialized
+
+### Authentication Errors
+- Verify JWT_SECRET matches WordPress
+- Check token hasn't expired (default 7 days)
+- Ensure user has correct role (wcfm_vendor for vendor operations)
+
+---
+
+When working on this project:
+1. Always test locally first with `npm run dev`
+2. Use the test scripts in `scripts/` directory
+3. Check dev server logs for errors
+4. Verify changes don't break existing functionality
+5. Update this document when adding new features

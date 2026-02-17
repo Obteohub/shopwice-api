@@ -20,6 +20,7 @@ const typeDefs = gql`
     description: String
     parent: Int
     count: Int
+    image: Image
     ancestors: ProductCategoryConnection
   }
 
@@ -222,12 +223,32 @@ const typeDefs = gql`
     role: String
   }
 
+  input RegisterVendorInput {
+    email: String!
+    password: String!
+    username: String
+    firstName: String
+    lastName: String
+    shopName: String!
+    phone: String
+    address: VendorAddressInput
+  }
+
+  input VendorAddressInput {
+    street_1: String
+    city: String
+    state: String
+    zip: String
+    country: String
+  }
+
   input RegisterCustomerInput {
     email: String!
     password: String!
     username: String
     firstName: String
     lastName: String
+    role: String
   }
 
   input AddToCartInput {
@@ -347,10 +368,41 @@ const typeDefs = gql`
     deleteProduct(id: ID!): Boolean
     
     registerCustomer(input: RegisterCustomerInput!): Customer
+    registerVendor(input: RegisterVendorInput!): Vendor
     
+    login(input: LoginInput!): AuthResponse
     loginWithSocial(input: SocialLoginInput!): AuthResponse
+    
+    sendPasswordResetEmail(input: SendPasswordResetEmailInput!): SendPasswordResetEmailPayload
+    resetPassword(input: ResetPasswordInput!): ResetPasswordPayload
 
     addToCart(input: AddToCartInput!): AddToCartPayload
+  }
+
+  input SendPasswordResetEmailInput {
+    email: String!
+    app: String
+  }
+
+  type SendPasswordResetEmailPayload {
+    success: Boolean
+    message: String
+  }
+
+  input ResetPasswordInput {
+    user_login: String!
+    password_reset_key: String!
+    new_password: String!
+  }
+
+  type ResetPasswordPayload {
+    success: Boolean
+    message: String
+  }
+
+  input LoginInput {
+    username: String!
+    password: String!
   }
 
   input SocialLoginInput {
@@ -423,6 +475,14 @@ const typeDefs = gql`
     youtube: String
   }
 
+  type VendorStats {
+    product_count: Int
+    total_sales: String
+    total_orders: Int
+    total_earnings: String
+    items_sold: Int
+  }
+
   type Vendor {
     id: ID!
     shopName: String
@@ -441,6 +501,7 @@ const typeDefs = gql`
     productCount: Int
     memberSince: String
     isEnabled: Boolean
+    stats: VendorStats
   }
 
   type VendorEdge {
@@ -476,11 +537,33 @@ const typeDefs = gql`
     commission_status: String
     total: String
     commission: String
+    customer_name: String
+    customer_email: String
+    customer: Customer
     items: [OrderItem]
+  }
+
+  type OrderEdge {
+    cursor: String!
+    node: Order!
+  }
+
+  type OrderConnection {
+    edges: [OrderEdge!]!
+    nodes: [Order!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
   }
 
   type Query {
     order(id: ID!): Order
+    orders(
+      first: Int
+      after: String
+      page: Int
+      perPage: Int
+      status: String
+    ): OrderConnection
     product(id: ID!): Product
     # Support both old style (direct args) and new style (where arg) for compatibility
     products(
@@ -524,6 +607,11 @@ const typeDefs = gql`
     ): ProductConnection
     
     productCategories(where: ProductCategoryQueryArgs): ProductCategoryConnection
+    productTags(where: ProductCategoryQueryArgs): ProductCategoryConnection
+    productBrands(where: ProductCategoryQueryArgs): ProductBrandConnection
+    productLocations(where: ProductCategoryQueryArgs): ProductLocationConnection
+    productAttributeTaxonomies(where: ProductCategoryQueryArgs): AttributeTaxonomyConnection
+    terms(taxonomy: [String], where: ProductCategoryQueryArgs): ProductCategoryConnection
     
     # Cart Query
     cart: Cart
@@ -531,6 +619,24 @@ const typeDefs = gql`
 
   input ProductCategoryQueryArgs {
     slug: [String]
+    id: ID
+    search: String
+    forceRefresh: Boolean
+    parentId: Int
+    parent: Int
+  }
+
+  type AttributeTaxonomy {
+    id: ID!
+    name: String
+    slug: String
+    type: String
+    orderBy: String
+    hasArchives: Boolean
+  }
+
+  type AttributeTaxonomyConnection {
+    nodes: [AttributeTaxonomy]
   }
 `;
 

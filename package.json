@@ -9,7 +9,9 @@
     "test": "node scripts/test_itty.mjs",
     "test:resilience": "node scripts/test_resilience.mjs",
     "db:seed": "node scripts/seed_products.js",
-    "db:download": "node scripts/download_products.js"
+    "db:download": "node scripts/download_products.js",
+    "db:seed:media": "wrangler d1 execute shopwice-db --local --file=seed_media.sql",
+    "db:seed:media:remote": "wrangler d1 execute shopwice-db --file=seed_media.sql"
   },
   "keywords": [],
   "author": "",

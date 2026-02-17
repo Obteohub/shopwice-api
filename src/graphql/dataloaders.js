@@ -4,9 +4,11 @@ const DataLoader = require('dataloader');
 
 function createLoaders() {
     const skuLoader = new DataLoader(async (productIds) => {
+        if (productIds.length === 0) return [];
+        const placeholders = productIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = '_sku' AND post_id IN (?)`,
-            [productIds]
+            `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = '_sku' AND post_id IN (${placeholders})`,
+            productIds
         );
         const map = {};
         rows.forEach(r => { map[r.post_id] = r.meta_value; });
@@ -14,9 +16,11 @@ function createLoaders() {
     });
 
     const imageLoader = new DataLoader(async (productIds) => {
+        if (productIds.length === 0) return [];
+        const placeholders = productIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = '_thumbnail_id' AND post_id IN (?)`,
-            [productIds]
+            `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = '_thumbnail_id' AND post_id IN (${placeholders})`,
+            productIds
         );
         const map = {};
         rows.forEach(r => { map[r.post_id] = r.meta_value; });
@@ -24,9 +28,11 @@ function createLoaders() {
     });
 
     const galleryLoader = new DataLoader(async (productIds) => {
+        if (productIds.length === 0) return [];
+        const placeholders = productIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = '_product_image_gallery' AND post_id IN (?)`,
-            [productIds]
+            `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = '_product_image_gallery' AND post_id IN (${placeholders})`,
+            productIds
         );
         const map = {};
         rows.forEach(r => { map[r.post_id] = r.meta_value; });
@@ -34,13 +40,15 @@ function createLoaders() {
     });
 
     const taxonomyLoader = new DataLoader(async (productIds) => {
+        if (productIds.length === 0) return [];
+        const placeholders = productIds.map(() => '?').join(',');
         const [rows] = await db.query(`
             SELECT tr.object_id, t.term_id as id, t.name, t.slug, tt.taxonomy
             FROM wp_term_relationships tr
             JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
             JOIN wp_terms t ON tt.term_id = t.term_id
-            WHERE tr.object_id IN (?)
-        `, [productIds]);
+            WHERE tr.object_id IN (${placeholders})
+        `, productIds);
 
         const map = {};
         rows.forEach(r => {
@@ -51,9 +59,11 @@ function createLoaders() {
     });
 
     const metaLoader = new DataLoader(async (productIds) => {
+        if (productIds.length === 0) return [];
+        const placeholders = productIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT post_id, meta_key, meta_value FROM wp_postmeta WHERE post_id IN (?) AND meta_key IN ('_product_attributes', '_short_description', '_price', '_regular_price', '_sale_price', 'total_sales', '_stock', '_stock_status', '_manage_stock', '_type', '_average_rating', '_rating_count', '_upsell_ids', '_crosssell_ids')`,
-            [productIds]
+            `SELECT post_id, meta_key, meta_value FROM wp_postmeta WHERE post_id IN (${placeholders}) AND meta_key IN ('_product_attributes', '_short_description', '_price', '_regular_price', '_sale_price', 'total_sales', '_stock', '_stock_status', '_manage_stock', '_type', '_average_rating', '_rating_count', '_upsell_ids', '_crosssell_ids')`,
+            productIds
         );
         const map = {};
         rows.forEach(r => {
@@ -64,9 +74,11 @@ function createLoaders() {
     });
 
     const excerptLoader = new DataLoader(async (productIds) => {
+        if (productIds.length === 0) return [];
+        const placeholders = productIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT ID, post_excerpt FROM wp_posts WHERE ID IN (?)`,
-            [productIds]
+            `SELECT ID, post_excerpt FROM wp_posts WHERE ID IN (${placeholders})`,
+            productIds
         );
         const map = {};
         rows.forEach(r => { map[r.ID] = r.post_excerpt; });
@@ -75,6 +87,7 @@ function createLoaders() {
 
     const productSummaryLoader = new DataLoader(async (ids) => {
         if (!ids.length) return [];
+        const placeholders = ids.map(() => '?').join(',');
         const [pRows] = await db.query(`
             SELECT
                 p.ID as id,
@@ -85,13 +98,14 @@ function createLoaders() {
                 (SELECT meta_value FROM wp_postmeta WHERE post_id = p.ID AND meta_key = '_thumbnail_id' LIMIT 1) as imageId
             FROM wp_posts p
             LEFT JOIN wp_wc_product_meta_lookup lookup ON p.ID = lookup.product_id
-            WHERE p.ID IN (?) AND p.post_type IN ('product', 'product_variation')
-        `, [ids]);
+            WHERE p.ID IN (${placeholders}) AND p.post_type IN ('product', 'product_variation')
+        `, ids);
 
         const imgMap = {};
         const imgIds = pRows.map(r => r.imageId).filter(Boolean);
         if (imgIds.length) {
-            const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (?)`, [imgIds]);
+            const imgPlaceholders = imgIds.map(() => '?').join(',');
+            const [imgRows] = await db.query(`SELECT ID, guid FROM wp_posts WHERE ID IN (${imgPlaceholders})`, imgIds);
             imgRows.forEach(i => { imgMap[i.ID] = i.guid; });
         }
 
@@ -119,9 +133,10 @@ function createLoaders() {
 
     const imageDetailsLoader = new DataLoader(async (imageIds) => {
         if (!imageIds.length) return [];
+        const placeholders = imageIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT ID, guid, post_title, post_excerpt FROM wp_posts WHERE ID IN (?)`,
-            [imageIds]
+            `SELECT ID, guid, post_title, post_excerpt FROM wp_posts WHERE ID IN (${placeholders})`,
+            imageIds
         );
         const map = {};
         rows.forEach(r => {
@@ -137,9 +152,11 @@ function createLoaders() {
     });
 
     const variationAttributeLoader = new DataLoader(async (variationIds) => {
+        if (!variationIds.length) return [];
+        const placeholders = variationIds.map(() => '?').join(',');
         const [rows] = await db.query(
-            `SELECT post_id, meta_key, meta_value FROM wp_postmeta WHERE post_id IN (?) AND meta_key LIKE 'attribute_%'`,
-            [variationIds]
+            `SELECT post_id, meta_key, meta_value FROM wp_postmeta WHERE post_id IN (${placeholders}) AND meta_key LIKE 'attribute_%'`,
+            variationIds
         );
         const map = {};
         rows.forEach(r => {
