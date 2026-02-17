@@ -23,6 +23,7 @@
     "graphql-tag": "^2.12.6",
     "graphql-yoga": "^5.18.0",
     "itty-router": "^5.0.22",
+    "node-fetch": "^2.7.0",
     "php-serialize": "^5.1.3"
   },
   "devDependencies": {
