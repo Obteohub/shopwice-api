@@ -650,16 +650,19 @@ router.get('/vendor/products', async (req, env) => {
 
     if (!userId || !token) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
 
-    // Use standard WC API with Vendor Token for listing products
-    // This ensures we see what the vendor sees (and WCFM filters it)
-    const api = new FetchClient(env, 'wc', token);
+    // Use WCFM API with Vendor Token for listing products
+    // WCFM automatically filters by the token's authenticated vendor, 
+    // but passing vendor_id explicitly helps legacy configurations.
+    const api = new FetchClient(env, 'wcfm', token);
 
     try {
         const params = { ...req.query };
-        if (params.vendor_id) delete params.vendor_id;
+        if (!params.vendor_id) params.vendor_id = userId;
 
         // Ensure status=any to see pending products
         if (!params.status) params.status = 'any';
+        // Increase per_page to show all vendor products
+        if (!params.per_page) params.per_page = 100;
 
         const data = await api.get('/products', params);
         return new Response(JSON.stringify(data));

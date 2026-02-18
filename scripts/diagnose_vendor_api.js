@@ -25,6 +25,7 @@ async function testVendorFlow() {
         console.log('Token (snippet):', token.substring(0, 20) + '...');
 
         console.log('\nFetching Vendor Products...');
+        // The API now handles author and per_page automatically
         const productsRes = await fetch(`${baseUrl}/vendor/products`, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
@@ -34,6 +35,10 @@ async function testVendorFlow() {
             console.error('Fetch Products Failed:', productsRes.status, productsData);
         } else {
             console.log(`Success! Found ${productsData.length} products. ✅`);
+            if (productsData.length > 0) {
+                console.log('Sample Product:', productsData[0].id, productsData[0].name);
+                console.log('Sample Product Author ID:', productsData[0].author);
+            }
         }
 
         console.log('\nFetching Vendor Orders...');
