@@ -28,7 +28,7 @@ export async function getCollectionData(req, res) {
         if (search) args.where.search = search;
         if (minPrice) args.where.minPrice = parseFloat(minPrice);
         if (maxPrice) args.where.maxPrice = parseFloat(maxPrice);
-        
+
         if (brand) args.where.brands = brand.split(',').map(s => s.trim());
         if (location) args.where.locations = location.split(',').map(s => s.trim());
         if (tag) args.where.tag = tag;
@@ -36,9 +36,9 @@ export async function getCollectionData(req, res) {
         // Context
         const env = req.env || (process && process.env) || {};
         const context = {
-            env: { ...env, CACHE: env.shopwice_cache },
+            env: { ...env, CACHE: env.CACHE || env.shopwice_cache },
             loaders: createLoaders(),
-            waitUntil: (promise) => { if(env.waitUntil) env.waitUntil(promise); }
+            waitUntil: (promise) => { if (env.waitUntil) env.waitUntil(promise); }
         };
 
         // Call Resolver
@@ -57,7 +57,7 @@ export async function getCollectionData(req, res) {
                     const taxonomy = attr.slug || (attr.name.toLowerCase().startsWith('pa_')
                         ? attr.name
                         : `pa_${attr.name.toLowerCase().replace(/\s+/g, '-')}`);
-                    
+
                     const label = attr.label || attr.name;
 
                     if (!attributeMap.has(taxonomy)) {
@@ -128,7 +128,7 @@ export async function getCollectionData(req, res) {
         res.json({ attributes });
 
     } catch (error) {
-         console.error('Collection data error:', error);
-         return res.status(500).json({ error: error.message });
+        console.error('Collection data error:', error);
+        return res.status(500).json({ error: error.message });
     }
 }

@@ -10,8 +10,8 @@ const SyncService = {
      * Sync a Product from WooCommerce JSON to D1
      * @param {Object} product - The product JSON object from WooCommerce
      */
-    async syncProduct(product) {
-        console.log(`🔄 Syncing Product ID: ${product.id}`);
+    async syncProduct(product, env) {
+        console.log(`🔄 Syncing Product ID: ${product.id} (Type: ${product.type})`);
 
         try {
             // 1. Update/Insert into wp_posts
@@ -20,7 +20,7 @@ const SyncService = {
             // 2. Update/Insert Meta (Price, SKU, etc.)
             await this.upsertProductMeta(product);
 
-            // 3. Update Categories (Terms)
+            // 3. Update Categories (Terms) - variations don't usually have their own cats, but if they do...
             if (product.categories) {
                 await this.syncTerms(product.id, product.categories, 'product_cat');
             }
@@ -31,13 +31,9 @@ const SyncService = {
             }
 
             // 4b. Update Locations (product_location taxonomy)
-            if (product.locations && product.locations.length > 0) {
-                await this.syncTerms(product.id, product.locations, 'product_location');
-            }
-
-            // 4c. Update Brands (product_brand taxonomy)
-            if (product.brands && product.brands.length > 0) {
-                await this.syncTerms(product.id, product.brands, 'product_brand');
+            const locations = product.locations || product.location_ids || product.product_location || product.location;
+            if (locations && Array.isArray(locations) && locations.length > 0) {
+                await this.syncTerms(product.id, locations, 'product_location');
             }
 
             // 5. Sync Images (Attachments)
@@ -48,6 +44,11 @@ const SyncService = {
             // 6. Update Lookup Table (Critical for filtering)
             await this.updateLookupTable(product);
 
+            // 7. Sync Variations (if variable product)
+            if (product.type === 'variable' && product.variations && product.variations.length > 0) {
+                await this.syncVariations(product, env);
+            }
+
             console.log(`✅ Product ${product.id} synced successfully`);
             return true;
         } catch (error) {
@@ -56,13 +57,60 @@ const SyncService = {
         }
     },
 
+    async syncVariations(parentProduct, env) {
+        if (!env) {
+            console.warn(`⚠️ Cannot sync variations for product ${parentProduct.id}: missing env`);
+            return;
+        }
+
+        console.log(`🔄 Syncing Variations for Product ${parentProduct.id}...`);
+        const WooCommerceClient = require('../utils/wc-client.js');
+        const wc = new WooCommerceClient(env);
+        const parentAuthor = parentProduct.author || parentProduct.post_author;
+
+        // Fetch variations in chunks to avoid overloading and timeouts
+        const CHUNK_SIZE = 5;
+        const variations = parentProduct.variations || [];
+
+        for (let i = 0; i < variations.length; i += CHUNK_SIZE) {
+            const chunk = variations.slice(i, i + CHUNK_SIZE);
+            await Promise.all(chunk.map(async (varId) => {
+                try {
+                    // Fetch full variation data
+                    const variation = await wc.get(`/products/${parentProduct.id}/variations/${varId}`);
+
+                    // Ensure parent_id and author are set
+                    variation.parent_id = parentProduct.id;
+                    variation.type = 'variation';
+                    if (parentAuthor) variation.author = parentAuthor;
+
+                    // Reuse sync logic
+                    await this.upsertPost(variation);
+                    await this.upsertProductMeta(variation);
+                    if (variation.image) {
+                        await this.syncImages([variation.image], variation.id);
+                    }
+                    await this.updateLookupTable(variation);
+
+                    console.log(`✅ Variation ${variation.id} synced`);
+                } catch (e) {
+                    console.error(`❌ Failed to sync variation ${varId}:`, e.message);
+                }
+            }));
+        }
+    },
+
     async upsertPost(p) {
+        // Determine post_type
+        let postType = 'product';
+        if (p.type === 'variation') postType = 'product_variation';
+
         const sql = `
             INSERT INTO wp_posts (
                 ID, post_author, post_date, post_date_gmt, post_content, post_title, 
                 post_excerpt, post_status, comment_status, ping_status, post_name, 
-                post_modified, post_modified_gmt, post_parent, guid, post_type, menu_order
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'product', ?)
+                post_type, post_parent, guid, menu_order, post_modified, post_modified_gmt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ID) DO UPDATE SET
                 post_title = excluded.post_title,
                 post_content = excluded.post_content,
@@ -73,6 +121,7 @@ const SyncService = {
                 post_modified = excluded.post_modified,
                 post_modified_gmt = excluded.post_modified_gmt,
                 post_parent = excluded.post_parent,
+                post_type = excluded.post_type,
                 menu_order = excluded.menu_order
         `;
 
@@ -88,17 +137,19 @@ const SyncService = {
             'open', // comment_status
             'closed', // ping_status
             p.slug || '',
-            p.date_modified || new Date().toISOString(),
-            p.date_modified_gmt || new Date().toISOString(),
-            p.parent_id || 0,
+            postType, // post_type
+            p.parent_id || 0, // post_parent
             p.permalink || '',
-            p.menu_order || 0
+            p.menu_order || 0,
+            p.date_modified || new Date().toISOString(),
+            p.date_modified_gmt || new Date().toISOString()
         ];
 
         await db.query(sql, values);
     },
 
     async upsertProductMeta(p) {
+        // Core fields mapping
         const meta = {
             '_sku': p.sku,
             '_regular_price': p.regular_price,
@@ -113,43 +164,48 @@ const SyncService = {
             '_length': p.dimensions?.length,
             '_width': p.dimensions?.width,
             '_height': p.dimensions?.height,
-            '_thumbnail_id': p.images?.[0]?.id
+            '_thumbnail_id': p.image ? p.image.id : (p.images?.[0]?.id),
+            'total_sales': p.total_sales || 0,
+            '_upsell_ids': JSON.stringify(p.upsell_ids || []),
+            '_crosssell_ids': JSON.stringify(p.cross_sell_ids || [])
         };
 
-        // Handle WCFM Author Meta
-        // Try to find in meta_data first
-        let wcfmAuthor = null;
-        if (p.meta_data) {
-            const authorMeta = p.meta_data.find(m => m.key === '_wcfm_product_author');
-            if (authorMeta) wcfmAuthor = authorMeta.value;
-        }
-        // Fallback to post_author if not found in meta but present in object
-        if (!wcfmAuthor && p.author) {
-            wcfmAuthor = p.author;
-        }
-        if (!wcfmAuthor && p.post_author) {
-            wcfmAuthor = p.post_author;
+        // Initialize with default meta values
+        const finalMeta = { ...meta };
+
+        // 1. Process meta_data array from WooCommerce (highest priority)
+        if (p.meta_data && Array.isArray(p.meta_data)) {
+            p.meta_data.forEach(m => {
+                if (m.key) {
+                    // Extract value, handling arrays if needed (WooCommerce sends objects/arrays for some)
+                    let val = m.value;
+                    if (typeof val === 'object' && val !== null) val = JSON.stringify(val);
+                    finalMeta[m.key] = String(val);
+                }
+            });
         }
 
-        if (wcfmAuthor) {
-            meta['_wcfm_product_author'] = wcfmAuthor;
-        }
+        // 2. Special handling for explicit product fields that are often requested
+        if (p.attributes) finalMeta['_product_attributes'] = typeof p.attributes === 'string' ? p.attributes : JSON.stringify(p.attributes);
+        if (p.upsell_ids) finalMeta['_upsell_ids'] = JSON.stringify(p.upsell_ids);
+        if (p.cross_sell_ids) finalMeta['_crosssell_ids'] = JSON.stringify(p.cross_sell_ids);
 
-        // Handle WCFM Views
-        if (p.meta_data) {
-            const viewsMeta = p.meta_data.find(m => m.key === '_wcfm_product_views');
-            if (viewsMeta) meta['_wcfm_product_views'] = viewsMeta.value;
-            else meta['_wcfm_product_views'] = '0'; // Default
-        }
+        // Map WCFM/Author fields
+        let wcfmAuthor = finalMeta['_wcfm_product_author'] || p.author || p.post_author;
+        if (wcfmAuthor) finalMeta['_wcfm_product_author'] = String(wcfmAuthor);
 
-        for (const [key, value] of Object.entries(meta)) {
+        // Save to DB
+        for (const [key, value] of Object.entries(finalMeta)) {
             if (value === undefined || value === null) continue;
 
-            // Delete existing meta for this key (ensure single value in replica)
-            await db.query("DELETE FROM wp_postmeta WHERE post_id = ? AND meta_key = ?", [p.id, key]);
-
-            // Insert new value
-            await db.query("INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (?, ?, ?)", [p.id, key, String(value)]);
+            // Robust metadata insertion: delete then insert (safer for SQLite concurrent)
+            // Check if this key already exists
+            // Using UPSERT style query
+            await db.query(`
+                INSERT INTO wp_postmeta (post_id, meta_key, meta_value) 
+                VALUES (?, ?, ?)
+                ON CONFLICT(post_id, meta_key) DO UPDATE SET meta_value = excluded.meta_value
+            `, [p.id, key, value]);
         }
     },
 

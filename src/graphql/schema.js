@@ -118,6 +118,7 @@ const typeDefs = gql`
     slug: String
     productId: Int
     link: String
+    url: String
     description: String
     shortDescription: String
     price: String

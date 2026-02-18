@@ -8,7 +8,7 @@ import { verifyJwt, decodeJwt } from '../src/utils/auth.js';
 
 export const onRequest = async (context) => {
     const { request, env } = context;
-    
+
     // Inject environment variables to services
     if (env) {
         if (db.init) db.init(env);
@@ -29,8 +29,8 @@ export const onRequest = async (context) => {
                 user = payload.data.user;
                 // Attempt to get role from payload or default to customer
                 // If the user is vendor 16533, ensure they have wcfm_vendor role for testing
-                if (user.id == 16533) { 
-                    user.role = 'wcfm_vendor'; 
+                if (user.id == 16533) {
+                    user.role = 'wcfm_vendor';
                 }
             }
         } catch (e) {
@@ -52,7 +52,7 @@ export const onRequest = async (context) => {
         landingPage: false,
         context: {
             ...context,
-            env: { ...context.env, CACHE: context.env.shopwice_cache },
+            env: { ...context.env, CACHE: context.env.CACHE || context.env.shopwice_cache },
             token,
             user,
             loaders: createLoaders(),
@@ -63,14 +63,14 @@ export const onRequest = async (context) => {
     });
 
     const response = await yoga.fetch(request, context);
-    
+
     // Merge any headers set by resolvers
     // Note: This only works if resolvers mutate context.responseHeaders
     // However, context in Yoga is recreated per request, so it should be safe.
-    
+
     // Create a new response with merged headers
     const newResponse = new Response(response.body, response);
-    
+
     // Append headers from our mutable object
     // Note: Headers.forEach is not always available in all environments, but typical for CF.
     if (responseHeaders) {
@@ -78,6 +78,6 @@ export const onRequest = async (context) => {
             newResponse.headers.append(key, value);
         }
     }
-    
+
     return newResponse;
 };

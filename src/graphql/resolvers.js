@@ -594,6 +594,8 @@ const resolvers = {
 
         // List products with pagination (Connection)
         async products(_, args, { loaders, env, waitUntil }) {
+            const nocache = args.nocache || (args.where && args.where.nocache);
+
             // Generate Cache Key with Versioning
             let cacheVersion = '1';
             if (env && env.CACHE) {
@@ -607,7 +609,7 @@ const resolvers = {
 
             const cacheKey = `products_v${cacheVersion}_${JSON.stringify(args)}`;
             let cached = null;
-            if (env && env.CACHE) {
+            if (env && env.CACHE && !nocache) {
                 try {
                     cached = await env.CACHE.get(cacheKey, { type: 'json' });
                 } catch (e) {
@@ -667,8 +669,17 @@ const resolvers = {
             if (category) {
                 joins.push(`JOIN wp_term_relationships tr_cat ON p.ID = tr_cat.object_id`);
                 joins.push(`JOIN wp_term_taxonomy tt_cat ON tr_cat.term_taxonomy_id = tt_cat.term_taxonomy_id`);
-                whereClauses.push(`tt_cat.taxonomy = 'product_cat' AND tt_cat.term_id = ?`);
-                params.push(category);
+
+                // Check if valid number (ID) or String (Slug)
+                if (/^\d+$/.test(category)) {
+                    whereClauses.push(`tt_cat.taxonomy = 'product_cat' AND tt_cat.term_id = ?`);
+                    params.push(category);
+                } else {
+                    // Treat as Slug
+                    joins.push(`JOIN wp_terms t_cat ON tt_cat.term_id = t_cat.term_id`);
+                    whereClauses.push(`tt_cat.taxonomy = 'product_cat' AND t_cat.slug = ?`);
+                    params.push(category);
+                }
             } else if (categoryName) {
                 joins.push(`JOIN wp_term_relationships tr_cat ON p.ID = tr_cat.object_id`);
                 joins.push(`JOIN wp_term_taxonomy tt_cat ON tr_cat.term_taxonomy_id = tt_cat.term_taxonomy_id`);
@@ -752,6 +763,19 @@ const resolvers = {
             const [countRows] = await db.query(countSql, params);
             const totalCount = countRows[0].total;
 
+            let orderByStr = 'p.post_date';
+            let orderStr = 'DESC';
+
+            if (where?.orderby) {
+                if (where.orderby === 'price') orderByStr = 'lookup.min_price';
+                else if (where.orderby === 'title') orderByStr = 'p.post_title';
+                else if (where.orderby === 'modified') orderByStr = 'p.post_modified';
+                else if (where.orderby === 'id') orderByStr = 'p.ID';
+            }
+            if (where?.order && ['ASC', 'DESC'].includes(where.order.toUpperCase())) {
+                orderStr = where.order.toUpperCase();
+            }
+
             // Main Query
             const sql = `
                 SELECT DISTINCT
@@ -759,6 +783,8 @@ const resolvers = {
                   p.post_title as name,
                   p.post_name as slug,
                   p.post_date as date,
+                  p.guid as link,
+                  p.guid as url,
                   lookup.min_price as price,
                   lookup.max_price as regularPrice,
                   lookup.stock_quantity as stockQuantity,
@@ -769,7 +795,7 @@ const resolvers = {
                 ${joins.join(' ')}
                 LEFT JOIN wp_wc_product_meta_lookup lookup ON p.ID = lookup.product_id
                 WHERE ${whereClauses.join(' AND ')}
-                ORDER BY p.post_date DESC
+                ORDER BY ${orderByStr} ${orderStr}, p.ID DESC
                 LIMIT ? OFFSET ?
             `;
 
@@ -840,7 +866,8 @@ const resolvers = {
                     databaseId: r.id,
                     name: r.name,
                     slug: r.slug,
-                    link: `https://shopwice.com/product/${r.slug}/`,
+                    link: r.link && r.link.includes('shopwice.com/product/') ? r.link : `https://shopwice.com/product/${r.slug}/`,
+                    url: r.link && r.link.includes('shopwice.com/product/') ? r.link : `https://shopwice.com/product/${r.slug}/`,
                     price: r.price ? r.price.toString() : "0",
                     regularPrice: r.regularPrice ? r.regularPrice.toString() : "0",
                     salePrice: meta._sale_price ? meta._sale_price.toString() : null,
@@ -1878,6 +1905,14 @@ const resolvers = {
     },
 
     Product: {
+        link: (parent) => {
+            if (parent.link && parent.link.includes('shopwice.com/product/')) return parent.link;
+            return `https://shopwice.com/product/${parent.slug || parent.post_name}/`;
+        },
+        url: (parent) => {
+            if (parent.link && parent.link.includes('shopwice.com/product/')) return parent.link;
+            return `https://shopwice.com/product/${parent.slug || parent.post_name}/`;
+        },
         allPaColor: (parent) => {
             const attributes = parent.attributes?.nodes || [];
             const colorAttr = attributes.find(a => a.id === 'pa_color' || a.slug === 'pa_color');

@@ -175,17 +175,19 @@ router.post('/webhooks/sync', async (req, env) => {
     try {
         console.log(`Received Webhook: ${topic}`);
         if (topic === 'product.created' || topic === 'product.updated') {
-            await SyncService.syncProduct(payload);
-            if (env.shopwice_cache) {
-                await env.shopwice_cache.delete(`product_${payload.id}`);
-                await env.shopwice_cache.put('product_list_version', Date.now().toString());
+            await SyncService.syncProduct(payload, env);
+            const cache = env.CACHE || env.shopwice_cache;
+            if (cache) {
+                await cache.delete(`product_${payload.id}`);
+                await cache.put('product_list_version', Date.now().toString());
                 console.log(`Cache invalidated for product_${payload.id} and list`);
             }
         } else if (topic === 'product.deleted') {
             await SyncService.deleteProduct(payload.id);
-            if (env.shopwice_cache) {
-                await env.shopwice_cache.delete(`product_${payload.id}`);
-                await env.shopwice_cache.put('product_list_version', Date.now().toString());
+            const cache = env.CACHE || env.shopwice_cache;
+            if (cache) {
+                await cache.delete(`product_${payload.id}`);
+                await cache.put('product_list_version', Date.now().toString());
             }
         } else {
             // Term webhooks: {taxonomy}.created | .updated | .deleted
@@ -355,6 +357,16 @@ router.get('/products', async (req, env) => {
         // Handle 'where' args simulation for REST params
         if (args.category) args.where = { categoryId: args.category };
         if (args.search) args.where = { search: args.search };
+
+        // Map REST params to GraphQL args
+        if (args.per_page) args.first = parseInt(args.per_page);
+        if (args.page && args.first) {
+            const offsetIdx = (parseInt(args.page) - 1) * args.first;
+            args.after = Buffer.from(`cursor:${offsetIdx - 1}`).toString('base64');
+        }
+        if (args.orderby || args.order) {
+            args.where = { ...args.where, orderby: args.orderby, order: args.order };
+        }
 
         // Call the GraphQL resolver logic directly
         const result = await resolvers.Query.products(null, args, context);
@@ -683,7 +695,7 @@ router.post('/vendor/products', async (req, env) => {
             if (env.DB) {
                 const dbConfig = require('../../src/config/db.js');
                 dbConfig.init(env);
-                await SyncService.syncProduct(data);
+                await SyncService.syncProduct(data, env);
             }
         }
 
@@ -717,7 +729,7 @@ router.post('/vendor/products/:id', async (req, env) => {
             if (env.DB) {
                 const dbConfig = require('../../src/config/db.js');
                 dbConfig.init(env);
-                await SyncService.syncProduct(data);
+                await SyncService.syncProduct(data, env);
             }
         }
 
@@ -1596,9 +1608,8 @@ const handleMediaUpload = async (req, env) => {
         ]);
 
         // Fetch ID
-        const result = await dbConfig.query("SELECT ID FROM wp_posts WHERE guid = ? ORDER BY ID DESC LIMIT 1", [publicUrl]);
-        const rows = result.results || result;
-        let newId = rows.length ? rows[0].ID : 0;
+        const [rows] = await dbConfig.query("SELECT ID FROM wp_posts WHERE guid = ? ORDER BY ID DESC LIMIT 1", [publicUrl]);
+        let newId = rows && rows.length ? rows[0].ID : 0;
 
         if (newId) {
             // Insert required metadata for WooCommerce image compatibility

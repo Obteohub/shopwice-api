@@ -93,6 +93,8 @@ function createLoaders() {
                 p.ID as id,
                 p.post_title as name,
                 p.post_name as slug,
+                p.guid as link,
+                p.guid as url,
                 lookup.min_price as price,
                 lookup.max_price as regularPrice,
                 (SELECT meta_value FROM wp_postmeta WHERE post_id = p.ID AND meta_key = '_thumbnail_id' LIMIT 1) as imageId
@@ -120,6 +122,8 @@ function createLoaders() {
                 databaseId: p.id,
                 name: p.name,
                 slug: p.slug,
+                link: p.link && p.link.includes('shopwice.com/product/') ? p.link : `https://shopwice.com/product/${p.slug}/`,
+                url: p.link && p.link.includes('shopwice.com/product/') ? p.link : `https://shopwice.com/product/${p.slug}/`,
                 price: p.price ? p.price.toString() : "0",
                 regularPrice: p.regularPrice ? p.regularPrice.toString() : "0",
                 image: featuredImage,
