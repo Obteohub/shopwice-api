@@ -35,9 +35,11 @@ async function testVendorFlow() {
             console.error('Fetch Products Failed:', productsRes.status, productsData);
         } else {
             console.log(`Success! Found ${productsData.length} products. ✅`);
+            console.log('Total Products Header (X-WP-Total):', productsRes.headers.get('X-WP-Total'));
+            console.log('Total Pages Header (X-WP-TotalPages):', productsRes.headers.get('X-WP-TotalPages'));
+
             if (productsData.length > 0) {
                 console.log('Sample Product:', productsData[0].id, productsData[0].name);
-                console.log('Sample Product Author ID:', productsData[0].author);
             }
         }
 
@@ -51,6 +53,8 @@ async function testVendorFlow() {
             console.error('Fetch Orders Failed:', ordersRes.status, ordersData);
         } else {
             console.log(`Success! Found ${ordersData.length} orders. ✅`);
+            console.log('Total Orders Header (X-WP-Total):', ordersRes.headers.get('X-WP-Total'));
+            console.log('Total Pages Header (X-WP-TotalPages):', ordersRes.headers.get('X-WP-TotalPages'));
         }
 
         console.log('\nTesting Media Upload...');

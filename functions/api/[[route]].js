@@ -290,12 +290,17 @@ class FetchClient {
     }
 
     async get(endpoint, params = {}) {
+        const { data } = await this.getWithResponse(endpoint, params);
+        return data;
+    }
+
+    async getWithResponse(endpoint, params = {}) {
         const url = new URL(this.baseURL + endpoint);
         Object.keys(params).forEach(key => url.searchParams.append(key, params[key]));
 
         const res = await fetch(url.toString(), { headers: this.headers });
         if (!res.ok) throw await this.handleError(res);
-        return await res.json();
+        return { data: await res.json(), response: res };
     }
 
     async post(endpoint, body = {}) {
@@ -651,8 +656,6 @@ router.get('/vendor/products', async (req, env) => {
     if (!userId || !token) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
 
     // Use WCFM API with Vendor Token for listing products
-    // WCFM automatically filters by the token's authenticated vendor, 
-    // but passing vendor_id explicitly helps legacy configurations.
     const api = new FetchClient(env, 'wcfm', token);
 
     try {
@@ -661,11 +664,19 @@ router.get('/vendor/products', async (req, env) => {
 
         // Ensure status=any to see pending products
         if (!params.status) params.status = 'any';
-        // Increase per_page to show all vendor products
+        // Increase per_page to show more products
         if (!params.per_page) params.per_page = 100;
 
-        const data = await api.get('/products', params);
-        return new Response(JSON.stringify(data));
+        const { data, response } = await api.getWithResponse('/products', params);
+
+        // Forward pagination headers
+        const headers = new Headers({ 'Content-Type': 'application/json' });
+        const total = response.headers.get('X-WP-Total');
+        const totalPages = response.headers.get('X-WP-TotalPages');
+        if (total) headers.set('X-WP-Total', total);
+        if (totalPages) headers.set('X-WP-TotalPages', totalPages);
+
+        return new Response(JSON.stringify(data), { headers });
     } catch (e) {
         return new Response(JSON.stringify(e.data || { error: e.message }), { status: e.status || 500 });
     }
@@ -807,10 +818,18 @@ router.get('/vendor/orders', async (req, env) => {
 
     try {
         const params = { ...req.query };
-        if (params.vendor_id) delete params.vendor_id;
+        if (!params.vendor_id) params.vendor_id = userId;
 
-        const data = await api.get('/orders', params);
-        return new Response(JSON.stringify(data));
+        const { data, response } = await api.getWithResponse('/orders', params);
+
+        // Forward pagination headers
+        const headers = new Headers({ 'Content-Type': 'application/json' });
+        const total = response.headers.get('X-WP-Total');
+        const totalPages = response.headers.get('X-WP-TotalPages');
+        if (total) headers.set('X-WP-Total', total);
+        if (totalPages) headers.set('X-WP-TotalPages', totalPages);
+
+        return new Response(JSON.stringify(data), { headers });
     } catch (e) {
         return new Response(JSON.stringify(e.data || { error: e.message }), { status: e.status || 500 });
     }
